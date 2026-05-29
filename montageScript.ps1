@@ -1,3 +1,49 @@
+#Rewriting this script to focus on video montages, no need for password protected zip, but maybe add .tar capability.
+#For now, focus on single, current working directory, no recurse yet.
+
+Param(
+    [int]$ppage=-1,
+    [int]$mpage=-1,
+    [string[]]$exDir,
+    [switch]$noPMontage=$false,
+    [switch]$noMMontage=$false,
+    [switch]$testMode=$false,
+    [switch]$noMove=$false
+)
+
+Function workInDir{
+    #Get video files section. Just mp4 for now.
+    $mp4list=&(get-childitem -path .\ -File -Name *.mp4)
+    if ($mp4list.length -eq 0){
+        Write-Host "Found no mp4 files in ",$PWD,". Moving on."
+        return
+    }
+    # if (($fileList.length -eq 0) -and ($mp4list.length -eq 0)){
+    #     Write-Host "Found no file in ",$PWD,". Moving on."
+    #     return
+    # }
+    if(!($noMMontage)){
+        if($mp4list.length -gt 0){
+            Write-Host "Working on mp4 files"
+            foreach ($item in $mp4list){
+                &(ffmpeg -i $item -vf 'fps=1,scale=200:-1,tile' "$item.%02d.jpg")
+            }
+        }
+    }
+}
+
+$workingFolder=$PWD
+
+if ($testMode){
+    Write-Host '$recurse is',$recurse#,$recurse.GetType()
+    Write-Host '$exDir is',$exDir#,$exDir.GetType()
+    Write-Host '$ppage is',$ppage#,$page.GetType()
+    Write-Host '$mpage is',$mpage#,$page.GetType()
+    return
+}
+
+
+#Old version from here, to be commented out.
 Param(
     [int]$ppage=-1,
     [int]$mpage=-1,
