@@ -1,0 +1,7 @@
+print("English")
+print("Français")
+print("Español")
+print("日本語")
+print("한국어")
+print("中文")
+print("😀")
