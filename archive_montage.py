@@ -53,7 +53,7 @@ DEFAULT_EXCLUDE_NAMES = {
 }
 
 DEFAULT_EXCLUDE_EXTENSIONS = {
-    ".db", ".sqlite", ".sqlite3", ".ini", ".xml", ".7z", ".zip",
+    ".db", ".sqlite", ".sqlite3", ".ini", ".xml", ".7z", ".zip",".py",".ps1",".git",".md"
 }
 
 
@@ -394,13 +394,20 @@ def should_include(path: Path, options: Options) -> bool:
         pass
     name_l = path.name.lower()
     ext_l = path.suffix.lower()
-    if name_l in options.exclude_names:
-        return False
-    if ext_l in options.exclude_exts:
-        return False
-    if options.include_exts is not None and ext_l not in options.include_exts:
-        return False
-    return True
+
+    if options.include_exts is None:
+        if name_l in options.exclude_names:
+            return False
+        if ext_l in options.exclude_exts:
+            return False
+    else:
+        if ext_l in options.include_exts:
+            return True
+        elif name_l in options.exclude_names:
+            return False
+        elif ext_l in options.exclude_exts:
+            return False
+    #return True
 
 
 def iter_paths(root: Path, recursive: bool) -> Iterable[Path]:
@@ -429,10 +436,49 @@ def insert_file_record(conn: sqlite3.Connection, scan_id: str, root: Path, path:
 
         sha256 = None
         blake2b = None
+
         if is_file and not options.no_hash:
-            sha256 = sha256_file(path)
-            if options.blake2b:
-                blake2b = blake2b_file(path)
+            size_bytes = st.st_size if is_file else None
+            print(size_bytes)
+            modified_time_utc = iso_from_timestamp(st.st_mtime)
+            print(modified_time_utc)
+            existing = conn.execute(
+                """
+                SELECT id
+                FROM files
+                WHERE size_bytes = ?
+                AND modified_time_utc = ?
+                LIMIT 1
+            """,(size_bytes, modified_time_utc,)).fetchone()
+            print(existing)
+            if (existing):
+                print(
+                    f"Skipping duplicate size_byte and modified_time_utc: {path} "
+                    f"(matches {existing[0]})",
+                    flush=True,
+                )
+                return 0  # special value indicating skipped
+            else:
+                sha256 = sha256_file(path)
+                existing = conn.execute(
+                    """
+                    SELECT id, full_path
+                    FROM files
+                    WHERE sha256 = ?
+                    LIMIT 1
+                    """,
+                    (sha256,)
+                ).fetchone()
+                if existing:
+                    print(
+                        f"Skipping duplicate SHA256: {path} "
+                        f"(matches {existing[0]})",
+                        flush=True,
+                    )
+                    return 0  # special value indicating skipped
+
+                if options.blake2b:
+                    blake2b = blake2b_file(path)
 
         stat_payload = {
             key: getattr(st, key)
@@ -573,9 +619,9 @@ def generate_video_montage(conn: sqlite3.Connection, scan_id: str, source_file_i
         return
     out_dir = artifact_dir_for(video.parent, root, options.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_pattern = out_dir / f"{video.name}.%02d.jpg"
+    out_pattern = out_dir / f"{video.name}.%03d.jpg"
     vf = f"fps={options.video_fps},scale={options.video_scale_width}:-1,tile={options.video_tile}"
-    args = ["-hide_banner", "-y", "-i", str(video), "-vf", vf, str(out_pattern)]
+    args = ["-hide_banner", "-n", "-i", str(video), "-vf", vf, str(out_pattern)]
     if options.dry_run:
         result = subprocess.CompletedProcess([options.ffmpeg, *args], 0, "DRY RUN", "")
     else:
@@ -687,9 +733,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-image-montage", action="store_true", help="Do not generate image contact sheets.")
     parser.add_argument("--recursive", action=argparse.BooleanOptionalAction, default=True, help="Walk recursively. Default: true.")
     parser.add_argument("--per-directory-montage", action=argparse.BooleanOptionalAction, default=True, help="Create image montages per source directory. Default: true.")
-    parser.add_argument("--video-fps", default="1", help="FFmpeg fps filter value for video thumbnails. Default: 1.")
-    parser.add_argument("--video-scale-width", type=int, default=200, help="Video thumbnail width. Default: 200.")
-    parser.add_argument("--video-tile", default="5x5", help="FFmpeg tile layout. Default: 5x5.")
+    parser.add_argument("--video-fps", default="0.1", help="FFmpeg fps filter value for video thumbnails. Default: 0.1.")
+    parser.add_argument("--video-scale-width", type=int, default=400, help="Video thumbnail width. Default: 400.")
+    parser.add_argument("--video-tile", default="15x15", help="FFmpeg tile layout. Default: 15x15.")
     parser.add_argument("--image-tile", default="15x15", help="ImageMagick montage tile layout. Default: 15x15.")
     parser.add_argument("--image-geometry", default="300x300>", help="Image resize geometry before montage. Default: 300x300>.")
     parser.add_argument("--image-page-size", type=int, default=225, help="Images per montage page. Default: 225.")
@@ -697,7 +743,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ffprobe", default="ffprobe", help="ffprobe executable name/path.")
     parser.add_argument("--magick", default="magick", help="ImageMagick executable name/path.")
     parser.add_argument("--timeout", type=int, default=600, help="Per-command timeout in seconds. Default: 600.")
-    parser.add_argument("--include-exts", help="Comma-separated extension allowlist, e.g. .mp4,.jpg")
+    parser.add_argument("--include-exts", default=",".join(sorted(VIDEO_EXTENSIONS | IMAGE_EXTENSIONS)), help="Comma-separated extension allowlist, e.g. .mp4,.jpg")
     parser.add_argument("--exclude-exts", default=",".join(sorted(DEFAULT_EXCLUDE_EXTENSIONS)), help="Comma-separated extension blocklist.")
     parser.add_argument("--exclude-names", default=",".join(sorted(DEFAULT_EXCLUDE_NAMES)), help="Comma-separated filename blocklist.")
     parser.add_argument("--dry-run", action="store_true", help="Do not run ffmpeg/magick montage commands; record intended commands.")
@@ -784,6 +830,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             if not path.exists() and not path.is_symlink():
                 continue
             file_id = insert_file_record(conn, scan_id, root, path, options)
+            if file_id == 0:
+                continue
             count += 1
             if path.is_file():
                 ext = path.suffix.lower()

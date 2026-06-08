@@ -96,7 +96,7 @@ python archive_montage.py \
 Default video filter:
 
 ```text
-fps=1,scale=200:-1,tile=5x5
+fps=0.1,scale=400:-1,tile=15x15
 ```
 
 Example custom settings:
@@ -104,9 +104,9 @@ Example custom settings:
 ```bash
 python archive_montage.py \
   --root "/path/to/archive" \
-  --video-fps 0.5 \
-  --video-scale-width 240 \
-  --video-tile 4x4
+  --video-fps 0.1 \
+  --video-scale-width 400 \
+  --video-tile 15x15
 ```
 
 ## Image montage settings
