@@ -19,12 +19,22 @@ from datetime import datetime, timezone
 from pathlib import Path
 import subprocess
 import shutil
+import json
+from typing import Iterable, Optional, Sequence
+import uuid
+import sqlite3
+import platform
 
 SCANNER_VERSION = "2026.06.06-1"
 
 VIDEO_EXTENSIONS = {
     ".mp4", ".m4v", ".mov", ".mkv", ".avi", ".wmv", ".webm", ".flv",
     ".mpg", ".mpeg", ".m2ts", ".mts", ".ts", ".3gp", ".ogv",
+}
+
+IMAGE_EXTENSIONS = {
+    ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tif", ".tiff", ".webp",
+    ".heic", ".heif", ".avif",
 }
 
 DEFAULT_EXCLUDE_NAMES = {
@@ -34,6 +44,36 @@ DEFAULT_EXCLUDE_NAMES = {
 DEFAULT_EXCLUDE_EXTENSIONS = {
     ".db", ".sqlite", ".sqlite3", ".ini", ".xml", ".7z", ".zip",
 }
+
+@dataclass
+class Options:
+    root: Path
+    db: Path
+    output_dir: Path
+    scan_only: bool
+    montage_only: bool
+    no_hash: bool
+    blake2b: bool
+    no_ffprobe: bool
+    no_magick_identify: bool
+    no_video_montage: bool
+    no_image_montage: bool
+    recursive: bool
+    per_directory_montage: bool
+    video_fps: str
+    video_scale_width: int
+    video_tile: str
+    image_tile: str
+    image_geometry: str
+    image_page_size: int
+    ffmpeg: str
+    ffprobe: str
+    magick: str
+    timeout: int
+    include_exts: Optional[set[str]]
+    exclude_exts: set[str]
+    exclude_names: set[str]
+    dry_run: bool
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Cross-platform archival scanner and montage generator.")
@@ -66,6 +106,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dry-run", action="store_true", help="Do not run ffmpeg/magick montage commands; record intended commands.")
     return parser
 
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+def chunks(items: Sequence[Path], size: int) -> Iterable[Sequence[Path]]:
+    for i in range(0, len(items), size):
+        yield items[i:i + size]
+
 def command_available(name: str) -> bool:
     return shutil.which(name) is not None
 
@@ -95,6 +142,25 @@ def artifact_dir_for(source_dir: Path, root: Path, output_dir: Path) -> Path:
     rel = safe_relative(source_dir, root)
     safe_rel = Path(rel) if rel not in (".", "") else Path("root")
     return output_dir / safe_rel / "montages"
+
+def run_native(
+    exe: str,
+    args: Sequence[str],
+    cwd: Optional[Path] = None,
+    timeout: Optional[int] = None,
+) -> subprocess.CompletedProcess[str]:
+    """Run a native command with argument-array semantics and UTF-8 text capture."""
+    return subprocess.run(
+        [exe, *args],
+        cwd=str(cwd) if cwd else None,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=timeout,
+        check=False,
+    )
 
 def generate_video_montage(conn: sqlite3.Connection, scan_id: str, source_file_id: int, video: Path, root: Path, options: Options) -> None:
     if options.no_video_montage or options.scan_only:
@@ -128,3 +194,413 @@ def generate_video_montage(conn: sqlite3.Connection, scan_id: str, source_file_i
             utc_now_iso(),
         ),
     )
+
+
+def parse_ext_list(value: Optional[str]) -> Optional[set[str]]:
+    if not value:
+        return None
+    result = set()
+    for item in value.split(","):
+        item = item.strip().lower()
+        if not item:
+            continue
+        if not item.startswith("."):
+            item = "." + item
+        result.add(item)
+    return result
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    args = build_parser().parse_args(argv)
+    root = args.root.expanduser().resolve()
+    if not root.is_dir():
+        print(f"Root is not a directory: {root}", file=sys.stderr)
+        return 2
+
+    db = (args.db or (root / "archive_inventory.sqlite")).expanduser().resolve()
+    output_dir = (args.output_dir or (root / "Montages")).expanduser().resolve()
+    db.parent.mkdir(parents=True, exist_ok=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    options = Options(
+        root=root,
+        db=db,
+        output_dir=output_dir,
+        scan_only=args.scan_only,
+        montage_only=args.montage_only,
+        no_hash=args.no_hash,
+        blake2b=args.blake2b,
+        no_ffprobe=args.no_ffprobe,
+        no_magick_identify=args.no_magick_identify,
+        no_video_montage=args.no_video_montage,
+        no_image_montage=args.no_image_montage,
+        recursive=args.recursive,
+        per_directory_montage=args.per_directory_montage,
+        video_fps=args.video_fps,
+        video_scale_width=args.video_scale_width,
+        video_tile=args.video_tile,
+        image_tile=args.image_tile,
+        image_geometry=args.image_geometry,
+        image_page_size=args.image_page_size,
+        ffmpeg=args.ffmpeg,
+        ffprobe=args.ffprobe,
+        magick=args.magick,
+        timeout=args.timeout,
+        include_exts=parse_ext_list(args.include_exts),
+        exclude_exts=parse_ext_list(args.exclude_exts) or set(),
+        exclude_names={x.strip().lower() for x in args.exclude_names.split(",") if x.strip()},
+        dry_run=args.dry_run,
+    )
+
+    scan_id = str(uuid.uuid4())
+    started = utc_now_iso()
+    video_files: list[tuple[int, Path]] = []
+    image_files: list[Path] = []
+    count = 0
+
+    with sqlite3.connect(db) as conn:
+        conn.execute("PRAGMA foreign_keys=ON")
+        init_db(conn)
+        conn.execute(
+            """
+            INSERT INTO scans
+            (id, scan_started_utc, root_path, scanner_version, hostname, username, platform,
+             python_version, ffmpeg_available, ffprobe_available, magick_available)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                scan_id,
+                started,
+                str(root),
+                SCANNER_VERSION,
+                socket.gethostname(),
+                getpass.getuser(),
+                platform.platform(),
+                sys.version,
+                int(command_available(options.ffmpeg)),
+                int(command_available(options.ffprobe)),
+                int(command_available(options.magick)),
+            ),
+        )
+        conn.commit()
+
+        for path in iter_paths(root, options.recursive):
+            if not should_include(path, options):
+                continue
+            if not path.exists() and not path.is_symlink():
+                continue
+            file_id = insert_file_record(conn, scan_id, root, path, options)
+            count += 1
+            if path.is_file():
+                ext = path.suffix.lower()
+                if not options.montage_only:
+                    insert_media_metadata(conn, file_id, path, options)
+                if ext in VIDEO_EXTENSIONS:
+                    video_files.append((file_id, path))
+                elif ext in IMAGE_EXTENSIONS and not path.name.lower().startswith("montage-"):
+                    image_files.append(path)
+            if count % 100 == 0:
+                conn.commit()
+                print(f"Recorded {count} paths...", flush=True)
+
+        conn.commit()
+
+        for file_id, video in video_files:
+            print(f"Video montage: {video}", flush=True)
+            generate_video_montage(conn, scan_id, file_id, video, root, options)
+            conn.commit()
+
+        # print(f"Image montage source files: {len(image_files)}", flush=True)
+        # generate_image_montages(conn, scan_id, root, image_files, options)
+        # conn.commit()
+
+        conn.execute("UPDATE scans SET scan_finished_utc=? WHERE id=?", (utc_now_iso(), scan_id))
+        conn.commit()
+
+    print(f"Done. Recorded {count} paths.")
+    print(f"SQLite DB: {db}")
+    print(f"Montages: {output_dir}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
+def init_db(conn: sqlite3.Connection) -> None:
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS scans (
+            id TEXT PRIMARY KEY,
+            scan_started_utc TEXT NOT NULL,
+            scan_finished_utc TEXT,
+            root_path TEXT NOT NULL,
+            scanner_version TEXT NOT NULL,
+            hostname TEXT,
+            username TEXT,
+            platform TEXT,
+            python_version TEXT,
+            ffmpeg_available INTEGER,
+            ffprobe_available INTEGER,
+            magick_available INTEGER
+        );
+
+        CREATE TABLE IF NOT EXISTS files (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            scan_id TEXT NOT NULL,
+            full_path TEXT NOT NULL,
+            relative_path TEXT,
+            parent_path TEXT,
+            name TEXT NOT NULL,
+            stem TEXT,
+            extension TEXT,
+            casefold_path TEXT,
+            size_bytes INTEGER,
+            is_file INTEGER,
+            is_dir INTEGER,
+            is_symlink INTEGER,
+            link_target TEXT,
+            device_id INTEGER,
+            inode INTEGER,
+            mode_text TEXT,
+            mode_octal TEXT,
+            readonly INTEGER,
+            owner_name TEXT,
+            group_name TEXT,
+            uid INTEGER,
+            gid INTEGER,
+            created_time_utc TEXT,
+            birth_time_available INTEGER,
+            modified_time_utc TEXT,
+            accessed_time_utc TEXT,
+            metadata_changed_time_utc TEXT,
+            ctime_raw_utc TEXT,
+            mime_guess TEXT,
+            sha256 TEXT,
+            blake2b TEXT,
+            scan_time_utc TEXT NOT NULL,
+            stat_json TEXT,
+            error TEXT,
+            FOREIGN KEY(scan_id) REFERENCES scans(id)
+        );
+
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_files_scan_path ON files(scan_id, full_path);
+        CREATE INDEX IF NOT EXISTS idx_files_sha256 ON files(sha256);
+        CREATE INDEX IF NOT EXISTS idx_files_extension ON files(extension);
+        CREATE INDEX IF NOT EXISTS idx_files_relative_path ON files(relative_path);
+
+        CREATE TABLE IF NOT EXISTS media_metadata (
+            file_id INTEGER PRIMARY KEY,
+            duration_seconds REAL,
+            bit_rate INTEGER,
+            format_name TEXT,
+            video_codec TEXT,
+            audio_codec TEXT,
+            width INTEGER,
+            height INTEGER,
+            frame_rate TEXT,
+            stream_count INTEGER,
+            ffprobe_json TEXT,
+            magick_identify_json TEXT,
+            FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS generated_artifacts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            scan_id TEXT NOT NULL,
+            source_file_id INTEGER,
+            artifact_type TEXT NOT NULL,
+            artifact_path TEXT NOT NULL,
+            command TEXT,
+            exit_code INTEGER,
+            stdout TEXT,
+            stderr TEXT,
+            created_time_utc TEXT NOT NULL,
+            FOREIGN KEY(scan_id) REFERENCES scans(id),
+            FOREIGN KEY(source_file_id) REFERENCES files(id)
+        );
+        """
+    )
+    conn.commit()
+
+def insert_file_record(conn: sqlite3.Connection, scan_id: str, root: Path, path: Path, options: Options) -> int:
+    scan_time = utc_now_iso()
+    try:
+        st = path.lstat()
+        birth_ts, birth_available = file_birth_time(st)
+        meta_ts = metadata_changed_time(st)
+        owner, group, uid, gid = get_owner_group(path)
+        is_file = path.is_file()
+        is_dir = path.is_dir()
+        is_symlink = path.is_symlink()
+        link_target = None
+        if is_symlink:
+            try:
+                link_target = os.readlink(path)
+            except OSError:
+                link_target = None
+
+        sha256 = None
+        blake2b = None
+        if is_file and not options.no_hash:
+            sha256 = sha256_file(path)
+            if options.blake2b:
+                blake2b = blake2b_file(path)
+
+        stat_payload = {
+            key: getattr(st, key)
+            for key in dir(st)
+            if key.startswith("st_") and isinstance(getattr(st, key), (int, float, str, type(None)))
+        }
+
+        values = {
+            "scan_id": scan_id,
+            "full_path": path_text(path),
+            "relative_path": safe_relative(path, root),
+            "parent_path": path_text(path.parent),
+            "name": path.name,
+            "stem": path.stem,
+            "extension": path.suffix.lower(),
+            "casefold_path": path_text(path).casefold(),
+            "size_bytes": st.st_size if is_file else None,
+            "is_file": int(is_file),
+            "is_dir": int(is_dir),
+            "is_symlink": int(is_symlink),
+            "link_target": link_target,
+            "device_id": getattr(st, "st_dev", None),
+            "inode": getattr(st, "st_ino", None),
+            "mode_text": stat.filemode(st.st_mode),
+            "mode_octal": oct(st.st_mode),
+            "readonly": int(not bool(st.st_mode & stat.S_IWUSR)),
+            "owner_name": owner,
+            "group_name": group,
+            "uid": uid,
+            "gid": gid,
+            "created_time_utc": iso_from_timestamp(birth_ts),
+            "birth_time_available": int(birth_available),
+            "modified_time_utc": iso_from_timestamp(st.st_mtime),
+            "accessed_time_utc": iso_from_timestamp(st.st_atime),
+            "metadata_changed_time_utc": iso_from_timestamp(meta_ts),
+            "ctime_raw_utc": iso_from_timestamp(st.st_ctime),
+            "mime_guess": mimetypes.guess_type(path.name)[0],
+            "sha256": sha256,
+            "blake2b": blake2b,
+            "scan_time_utc": scan_time,
+            "stat_json": json.dumps(stat_payload, ensure_ascii=False, sort_keys=True),
+            "error": None,
+        }
+    except Exception as exc:
+        values = {
+            "scan_id": scan_id,
+            "full_path": path_text(path),
+            "relative_path": safe_relative(path, root),
+            "parent_path": path_text(path.parent),
+            "name": path.name,
+            "stem": path.stem,
+            "extension": path.suffix.lower(),
+            "casefold_path": path_text(path).casefold(),
+            "size_bytes": None,
+            "is_file": None,
+            "is_dir": None,
+            "is_symlink": None,
+            "link_target": None,
+            "device_id": None,
+            "inode": None,
+            "mode_text": None,
+            "mode_octal": None,
+            "readonly": None,
+            "owner_name": None,
+            "group_name": None,
+            "uid": None,
+            "gid": None,
+            "created_time_utc": None,
+            "birth_time_available": 0,
+            "modified_time_utc": None,
+            "accessed_time_utc": None,
+            "metadata_changed_time_utc": None,
+            "ctime_raw_utc": None,
+            "mime_guess": None,
+            "sha256": None,
+            "blake2b": None,
+            "scan_time_utc": scan_time,
+            "stat_json": None,
+            "error": repr(exc),
+        }
+
+    cols = list(values.keys())
+    placeholders = ",".join([":" + c for c in cols])
+    conn.execute(
+        f"INSERT INTO files ({','.join(cols)}) VALUES ({placeholders})",
+        values,
+    )
+    return int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+
+def insert_media_metadata(conn: sqlite3.Connection, file_id: int, path: Path, options: Options) -> None:
+    ext = path.suffix.lower()
+    probe = None
+    identify = None
+    if ext in VIDEO_EXTENSIONS and not options.no_ffprobe and command_available(options.ffprobe):
+        probe = ffprobe_json(path, options.ffprobe, options.timeout)
+    if ext in IMAGE_EXTENSIONS and not options.no_magick_identify and command_available(options.magick):
+        identify = magick_identify_json(path, options.magick, options.timeout)
+
+    if probe is None and identify is None:
+        return
+
+    summary = extract_media_summary(probe)
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO media_metadata (
+            file_id, duration_seconds, bit_rate, format_name, video_codec, audio_codec,
+            width, height, frame_rate, stream_count, ffprobe_json, magick_identify_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            file_id,
+            summary["duration_seconds"],
+            summary["bit_rate"],
+            summary["format_name"],
+            summary["video_codec"],
+            summary["audio_codec"],
+            summary["width"],
+            summary["height"],
+            summary["frame_rate"],
+            summary["stream_count"],
+            json.dumps(probe, ensure_ascii=False, sort_keys=True) if probe is not None else None,
+            json.dumps(identify, ensure_ascii=False, sort_keys=True) if identify is not None else None,
+        ),
+    )
+
+def extract_media_summary(probe: Optional[dict]) -> dict:
+    summary = {
+        "duration_seconds": None,
+        "bit_rate": None,
+        "format_name": None,
+        "video_codec": None,
+        "audio_codec": None,
+        "width": None,
+        "height": None,
+        "frame_rate": None,
+        "stream_count": None,
+    }
+    if not probe:
+        return summary
+
+    fmt = probe.get("format") or {}
+    summary["duration_seconds"] = _float_or_none(fmt.get("duration"))
+    summary["bit_rate"] = _int_or_none(fmt.get("bit_rate"))
+    summary["format_name"] = fmt.get("format_name")
+
+    streams = probe.get("streams") or []
+    summary["stream_count"] = len(streams)
+    for stream in streams:
+        codec_type = stream.get("codec_type")
+        if codec_type == "video" and summary["video_codec"] is None:
+            summary["video_codec"] = stream.get("codec_name")
+            summary["width"] = _int_or_none(stream.get("width"))
+            summary["height"] = _int_or_none(stream.get("height"))
+            summary["frame_rate"] = stream.get("avg_frame_rate") or stream.get("r_frame_rate")
+        elif codec_type == "audio" and summary["audio_codec"] is None:
+            summary["audio_codec"] = stream.get("codec_name")
+    return summary
