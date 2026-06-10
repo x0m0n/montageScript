@@ -439,9 +439,9 @@ def insert_file_record(conn: sqlite3.Connection, scan_id: str, root: Path, path:
 
         if is_file and not options.no_hash:
             size_bytes = st.st_size if is_file else None
-            print(size_bytes)
+            #print(size_bytes)
             modified_time_utc = iso_from_timestamp(st.st_mtime)
-            print(modified_time_utc)
+            #print(modified_time_utc)
             existing = conn.execute(
                 """
                 SELECT id
@@ -450,7 +450,7 @@ def insert_file_record(conn: sqlite3.Connection, scan_id: str, root: Path, path:
                 AND modified_time_utc = ?
                 LIMIT 1
             """,(size_bytes, modified_time_utc,)).fetchone()
-            print(existing)
+            #print(existing)
             if (existing):
                 print(
                     f"Skipping duplicate size_byte and modified_time_utc: {path} "
