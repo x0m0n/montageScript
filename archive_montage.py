@@ -620,8 +620,8 @@ def generate_video_montage(conn: sqlite3.Connection, scan_id: str, source_file_i
     out_dir = artifact_dir_for(video.parent, root, options.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     out_pattern = out_dir / f"{video.name}.%03d.jpg"
-    vf = f"fps={options.video_fps},scale={options.video_scale_width}:-1,tile={options.video_tile}"
-    args = ["-hide_banner", "-n", "-i", str(video), "-vf", vf, str(out_pattern)]
+    vf = f"thumbnail={options.video_fps},scale={options.video_scale_width}:-1,tile={options.video_tile}"
+    args = ["-hide_banner", "-n", "-i", str(video), "-vf", vf, "-frames:v", "1", str(out_pattern)]
     if options.dry_run:
         result = subprocess.CompletedProcess([options.ffmpeg, *args], 0, "DRY RUN", "")
     else:
@@ -733,8 +733,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-image-montage", action="store_true", help="Do not generate image contact sheets.")
     parser.add_argument("--recursive", action=argparse.BooleanOptionalAction, default=True, help="Walk recursively. Default: true.")
     parser.add_argument("--per-directory-montage", action=argparse.BooleanOptionalAction, default=True, help="Create image montages per source directory. Default: true.")
-    parser.add_argument("--video-fps", default="0.1", help="FFmpeg fps filter value for video thumbnails. Default: 0.1.")
-    parser.add_argument("--video-scale-width", type=int, default=400, help="Video thumbnail width. Default: 400.")
+    parser.add_argument("--video-fps", default="999", help="FFmpeg thumbnail filter value for video thumbnails. Default: 999.")
+    parser.add_argument("--video-scale-width", type=int, default=640, help="Video thumbnail width. Default: 640.")
     parser.add_argument("--video-tile", default="15x15", help="FFmpeg tile layout. Default: 15x15.")
     parser.add_argument("--image-tile", default="15x15", help="ImageMagick montage tile layout. Default: 15x15.")
     parser.add_argument("--image-geometry", default="300x300>", help="Image resize geometry before montage. Default: 300x300>.")
