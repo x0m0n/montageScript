@@ -742,7 +742,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ffmpeg", default="ffmpeg", help="ffmpeg executable name/path.")
     parser.add_argument("--ffprobe", default="ffprobe", help="ffprobe executable name/path.")
     parser.add_argument("--magick", default="magick", help="ImageMagick executable name/path.")
-    parser.add_argument("--timeout", type=int, default=600, help="Per-command timeout in seconds. Default: 600.")
+    parser.add_argument("--timeout", type=int, default=1800, help="Per-command timeout in seconds. Default: 1800.")
     parser.add_argument("--include-exts", default=",".join(sorted(VIDEO_EXTENSIONS | IMAGE_EXTENSIONS)), help="Comma-separated extension allowlist, e.g. .mp4,.jpg")
     parser.add_argument("--exclude-exts", default=",".join(sorted(DEFAULT_EXCLUDE_EXTENSIONS)), help="Comma-separated extension blocklist.")
     parser.add_argument("--exclude-names", default=",".join(sorted(DEFAULT_EXCLUDE_NAMES)), help="Comma-separated filename blocklist.")
