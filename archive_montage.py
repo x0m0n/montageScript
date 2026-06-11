@@ -31,7 +31,8 @@ import subprocess
 import sys
 import time
 import uuid
-from dataclasses import dataclass
+from contextlib import closing
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Optional, Sequence
@@ -245,6 +246,19 @@ def _int_or_none(value) -> Optional[int]:
         return None
 
 
+SQLITE_INT_MIN = -(2**63)
+SQLITE_INT_MAX = 2**63 - 1
+
+
+def sqlite_int_or_none(value) -> Optional[int]:
+    int_value = _int_or_none(value)
+    if int_value is None:
+        return None
+    if SQLITE_INT_MIN <= int_value <= SQLITE_INT_MAX:
+        return int_value
+    return None
+
+
 def init_db(conn: sqlite3.Connection) -> None:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
@@ -395,19 +409,13 @@ def should_include(path: Path, options: Options) -> bool:
     name_l = path.name.lower()
     ext_l = path.suffix.lower()
 
-    if options.include_exts is None:
-        if name_l in options.exclude_names:
-            return False
-        if ext_l in options.exclude_exts:
-            return False
-    else:
-        if ext_l in options.include_exts:
-            return True
-        elif name_l in options.exclude_names:
-            return False
-        elif ext_l in options.exclude_exts:
-            return False
-    #return True
+    if name_l in options.exclude_names:
+        return False
+    if ext_l in options.exclude_exts:
+        return False
+    if options.include_exts is not None:
+        return ext_l in options.include_exts
+    return True
 
 
 def iter_paths(root: Path, recursive: bool) -> Iterable[Path]:
@@ -500,15 +508,15 @@ def insert_file_record(conn: sqlite3.Connection, scan_id: str, root: Path, path:
             "is_dir": int(is_dir),
             "is_symlink": int(is_symlink),
             "link_target": link_target,
-            "device_id": getattr(st, "st_dev", None),
-            "inode": getattr(st, "st_ino", None),
+            "device_id": sqlite_int_or_none(getattr(st, "st_dev", None)),
+            "inode": sqlite_int_or_none(getattr(st, "st_ino", None)),
             "mode_text": stat.filemode(st.st_mode),
             "mode_octal": oct(st.st_mode),
             "readonly": int(not bool(st.st_mode & stat.S_IWUSR)),
             "owner_name": owner,
             "group_name": group,
-            "uid": uid,
-            "gid": gid,
+            "uid": sqlite_int_or_none(uid),
+            "gid": sqlite_int_or_none(gid),
             "created_time_utc": iso_from_timestamp(birth_ts),
             "birth_time_available": int(birth_available),
             "modified_time_utc": iso_from_timestamp(st.st_mtime),
@@ -621,7 +629,7 @@ def generate_video_montage(conn: sqlite3.Connection, scan_id: str, source_file_i
     out_dir.mkdir(parents=True, exist_ok=True)
     out_pattern = out_dir / f"{video.name}.%03d.jpg"
     vf = f"thumbnail={options.video_fps},scale={options.video_scale_width}:-1,tile={options.video_tile}"
-    args = ["-n", "-i", str(video), "-vf", vf, "-frames:v", "1", str(out_pattern)]
+    args = ["-hide_banner", "-y", "-i", str(video), "-vf", vf, str(out_pattern)]
     if options.dry_run:
         result = subprocess.CompletedProcess([options.ffmpeg, *args], 0, "DRY RUN", "")
     else:
@@ -647,14 +655,96 @@ def generate_video_montage(conn: sqlite3.Connection, scan_id: str, source_file_i
 
 
 def chunks(items: Sequence[Path], size: int) -> Iterable[Sequence[Path]]:
+    size = max(1, size)
     for i in range(0, len(items), size):
         yield items[i:i + size]
+
+
+def generate_image_montage_page(
+    conn: sqlite3.Connection,
+    scan_id: str,
+    root: Path,
+    source_dir: Path,
+    page_files: Sequence[Path],
+    page_num: int,
+    options: Options,
+) -> None:
+    if options.no_image_montage or options.scan_only:
+        return
+    if not page_files or not command_available(options.magick):
+        return
+    out_dir = artifact_dir_for(source_dir, root, options.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_file = out_dir / f"montage-{page_num:03d}.jpg"
+    args: list[str] = ["montage"]
+    for image in page_files:
+        # ImageMagick geometry suffix is intentionally a separate path-like token.
+        args.append(f"{image}[{options.image_geometry}]")
+    args.extend([
+        "-auto-orient",
+        "-mode", "concatenate",
+        "-set", "label", "%f",
+        "-tile", options.image_tile,
+        "-background", "#AB82FF",
+        str(out_file),
+    ])
+    if options.dry_run:
+        result = subprocess.CompletedProcess([options.magick, *args], 0, "DRY RUN", "")
+    else:
+        result = run_native(options.magick, args, timeout=options.timeout)
+    conn.execute(
+        """
+        INSERT INTO generated_artifacts
+        (scan_id, source_file_id, artifact_type, artifact_path, command, exit_code, stdout, stderr, created_time_utc)
+        VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            scan_id,
+            "image_montage",
+            str(out_file),
+            json.dumps([options.magick, *args], ensure_ascii=False),
+            result.returncode,
+            result.stdout,
+            result.stderr,
+            utc_now_iso(),
+        ),
+    )
+
+
+@dataclass
+class ImageMontageState:
+    buffers: dict[Path, list[Path]] = field(default_factory=dict)
+    next_page_numbers: dict[Path, int] = field(default_factory=dict)
+    source_count: int = 0
+
+    def add(self, image: Path, root: Path, options: Options) -> Optional[tuple[Path, int, list[Path]]]:
+        self.source_count += 1
+        if options.no_image_montage or options.scan_only:
+            return None
+        source_dir = image.parent if options.per_directory_montage else root
+        buffer = self.buffers.setdefault(source_dir, [])
+        buffer.append(image)
+        if len(buffer) >= max(1, options.image_page_size):
+            return self._take_page(source_dir)
+        return None
+
+    def flush_remaining(self) -> Iterable[tuple[Path, int, list[Path]]]:
+        for source_dir in sorted(self.buffers, key=path_text):
+            if self.buffers[source_dir]:
+                yield self._take_page(source_dir)
+
+    def _take_page(self, source_dir: Path) -> tuple[Path, int, list[Path]]:
+        page_num = self.next_page_numbers.get(source_dir, 1)
+        self.next_page_numbers[source_dir] = page_num + 1
+        page_files = list(self.buffers[source_dir])
+        self.buffers[source_dir].clear()
+        return source_dir, page_num, page_files
 
 
 def generate_image_montages(conn: sqlite3.Connection, scan_id: str, root: Path, image_files: Sequence[Path], options: Options) -> None:
     if options.no_image_montage or options.scan_only:
         return
-    if not image_files or not command_available(options.magick):
+    if not image_files:
         return
 
     by_dir: dict[Path, list[Path]] = {}
@@ -665,43 +755,8 @@ def generate_image_montages(conn: sqlite3.Connection, scan_id: str, root: Path, 
         by_dir[root] = list(image_files)
 
     for source_dir, files in by_dir.items():
-        out_dir = artifact_dir_for(source_dir, root, options.output_dir)
-        out_dir.mkdir(parents=True, exist_ok=True)
         for page_num, page_files in enumerate(chunks(files, options.image_page_size), start=1):
-            out_file = out_dir / f"montage-{page_num:03d}.jpg"
-            args: list[str] = ["montage"]
-            for image in page_files:
-                # ImageMagick geometry suffix is intentionally a separate path-like token.
-                args.append(f"{image}[{options.image_geometry}]")
-            args.extend([
-                "-auto-orient",
-                "-mode", "concatenate",
-                "-set", "label", "%f",
-                "-tile", options.image_tile,
-                "-background", "#AB82FF",
-                str(out_file),
-            ])
-            if options.dry_run:
-                result = subprocess.CompletedProcess([options.magick, *args], 0, "DRY RUN", "")
-            else:
-                result = run_native(options.magick, args, timeout=options.timeout)
-            conn.execute(
-                """
-                INSERT INTO generated_artifacts
-                (scan_id, source_file_id, artifact_type, artifact_path, command, exit_code, stdout, stderr, created_time_utc)
-                VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    scan_id,
-                    "image_montage",
-                    str(out_file),
-                    json.dumps([options.magick, *args], ensure_ascii=False),
-                    result.returncode,
-                    result.stdout,
-                    result.stderr,
-                    utc_now_iso(),
-                ),
-            )
+            generate_image_montage_page(conn, scan_id, root, source_dir, page_files, page_num, options)
 
 
 def parse_ext_list(value: Optional[str]) -> Optional[set[str]]:
@@ -743,7 +798,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ffprobe", default="ffprobe", help="ffprobe executable name/path.")
     parser.add_argument("--magick", default="magick", help="ImageMagick executable name/path.")
     parser.add_argument("--timeout", type=int, default=3600, help="Per-command timeout in seconds. Default: 3600.")
-    parser.add_argument("--include-exts", default=",".join(sorted(VIDEO_EXTENSIONS | IMAGE_EXTENSIONS)), help="Comma-separated extension allowlist, e.g. .mp4,.jpg")
+    parser.add_argument("--include-exts", default=None, help="Comma-separated extension allowlist, e.g. .mp4,.jpg. Default: scan all non-excluded files.")
     parser.add_argument("--exclude-exts", default=",".join(sorted(DEFAULT_EXCLUDE_EXTENSIONS)), help="Comma-separated extension blocklist.")
     parser.add_argument("--exclude-names", default=",".join(sorted(DEFAULT_EXCLUDE_NAMES)), help="Comma-separated filename blocklist.")
     parser.add_argument("--dry-run", action="store_true", help="Do not run ffmpeg/magick montage commands; record intended commands.")
@@ -794,11 +849,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     scan_id = str(uuid.uuid4())
     started = utc_now_iso()
-    video_files: list[tuple[int, Path]] = []
-    image_files: list[Path] = []
+    image_montages = ImageMontageState()
     count = 0
 
-    with sqlite3.connect(db) as conn:
+    with closing(sqlite3.connect(db)) as conn:
         conn.execute("PRAGMA foreign_keys=ON")
         init_db(conn)
         conn.execute(
@@ -838,23 +892,31 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 if not options.montage_only:
                     insert_media_metadata(conn, file_id, path, options)
                 if ext in VIDEO_EXTENSIONS:
-                    video_files.append((file_id, path))
+                    if not options.no_video_montage and not options.scan_only:
+                        conn.commit()
+                        print(f"Video montage: {path}", flush=True)
+                        generate_video_montage(conn, scan_id, file_id, path, root, options)
+                        conn.commit()
                 elif ext in IMAGE_EXTENSIONS and not path.name.lower().startswith("montage-"):
-                    image_files.append(path)
+                    page = image_montages.add(path, root, options)
+                    if page is not None:
+                        source_dir, page_num, page_files = page
+                        conn.commit()
+                        print(f"Image montage page {page_num}: {source_dir}", flush=True)
+                        generate_image_montage_page(conn, scan_id, root, source_dir, page_files, page_num, options)
+                        conn.commit()
             if count % 100 == 0:
                 conn.commit()
                 print(f"Recorded {count} paths...", flush=True)
 
         conn.commit()
 
-        for file_id, video in video_files:
-            print(f"Video montage: {video}", flush=True)
-            generate_video_montage(conn, scan_id, file_id, video, root, options)
+        print(f"Image montage source files: {image_montages.source_count}", flush=True)
+        for source_dir, page_num, page_files in image_montages.flush_remaining():
             conn.commit()
-
-        print(f"Image montage source files: {len(image_files)}", flush=True)
-        generate_image_montages(conn, scan_id, root, image_files, options)
-        conn.commit()
+            print(f"Image montage page {page_num}: {source_dir}", flush=True)
+            generate_image_montage_page(conn, scan_id, root, source_dir, page_files, page_num, options)
+            conn.commit()
 
         conn.execute("UPDATE scans SET scan_finished_utc=? WHERE id=?", (utc_now_iso(), scan_id))
         conn.commit()

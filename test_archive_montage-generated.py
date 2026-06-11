@@ -21,6 +21,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 from unittest.mock import patch
 
@@ -116,6 +117,9 @@ class ArchiveMontageUnitTests(unittest.TestCase):
             self.assertFalse(am.should_include(root / "Thumbs.db", options))
             self.assertFalse(am.should_include(root / "package.zip", options))
             self.assertTrue(am.should_include(root / "keep.mp4", options))
+            options.include_exts = {".mp4"}
+            self.assertTrue(am.should_include(root / "keep.mp4", options))
+            self.assertFalse(am.should_include(root / "notes.txt", options))
 
     def test_init_db_creates_expected_tables(self):
         with sqlite3.connect(":memory:") as conn:
@@ -201,12 +205,88 @@ class ArchiveMontageUnitTests(unittest.TestCase):
                 ).fetchone()
 
             self.assertEqual(row[0], "video_montage")
-            self.assertIn("動画.mp4.%02d.jpg", row[1])
+            self.assertIn("動画.mp4.%03d.jpg", row[1])
             self.assertEqual(row[3], 0)
             self.assertEqual(row[4], "DRY RUN")
             command = json.loads(row[2])
             self.assertIn("-vf", command)
-            self.assertIn("fps=1,scale=200:-1,tile=5x5", command)
+            self.assertIn("thumbnail=1,scale=200:-1,tile=5x5", command)
+            self.assertIn("-y", command)
+            self.assertNotIn("-n", command)
+            self.assertNotIn("-frames:v", command)
+
+    def test_main_generates_video_montages_during_single_scan_pass(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            first = root / "first.mp4"
+            second = root / "second.mp4"
+            first.write_bytes(b"first")
+            second.write_bytes(b"second")
+            db = root / "inventory.sqlite"
+            out = root / "Montages"
+            observed: list[tuple[str, list[str]]] = []
+
+            def fake_generate(conn, scan_id, source_file_id, video, scan_root, options):
+                with closing(sqlite3.connect(options.db)) as read_conn:
+                    names = [row[0] for row in read_conn.execute("SELECT name FROM files ORDER BY id")]
+                observed.append((video.name, names))
+
+            with patch.object(am, "iter_paths", return_value=iter([first, second])):
+                with patch.object(am, "generate_video_montage", side_effect=fake_generate):
+                    exit_code = am.main([
+                        "--root", str(root),
+                        "--db", str(db),
+                        "--output-dir", str(out),
+                        "--include-exts", ".mp4",
+                        "--no-image-montage",
+                        "--no-ffprobe",
+                        "--no-magick-identify",
+                        "--no-hash",
+                    ])
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(observed, [
+                ("first.mp4", ["first.mp4"]),
+                ("second.mp4", ["first.mp4", "second.mp4"]),
+            ])
+
+    def test_main_generates_image_pages_during_single_scan_pass(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            first = root / "first.jpg"
+            second = root / "second.jpg"
+            third = root / "third.jpg"
+            first.write_bytes(b"first")
+            second.write_bytes(b"second")
+            third.write_bytes(b"third")
+            db = root / "inventory.sqlite"
+            out = root / "Montages"
+            observed: list[tuple[int, list[str], list[str]]] = []
+
+            def fake_generate_page(conn, scan_id, scan_root, source_dir, page_files, page_num, options):
+                with closing(sqlite3.connect(options.db)) as read_conn:
+                    names = [row[0] for row in read_conn.execute("SELECT name FROM files ORDER BY id")]
+                observed.append((page_num, [p.name for p in page_files], names))
+
+            with patch.object(am, "iter_paths", return_value=iter([first, second, third])):
+                with patch.object(am, "generate_image_montage_page", side_effect=fake_generate_page):
+                    exit_code = am.main([
+                        "--root", str(root),
+                        "--db", str(db),
+                        "--output-dir", str(out),
+                        "--include-exts", ".jpg",
+                        "--no-video-montage",
+                        "--no-ffprobe",
+                        "--no-magick-identify",
+                        "--no-hash",
+                        "--image-page-size", "2",
+                    ])
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(observed, [
+                (1, ["first.jpg", "second.jpg"], ["first.jpg", "second.jpg"]),
+                (2, ["third.jpg"], ["first.jpg", "second.jpg", "third.jpg"]),
+            ])
 
     def test_main_scan_only_creates_database_with_unicode_file(self):
         with tempfile.TemporaryDirectory() as td:
@@ -227,7 +307,7 @@ class ArchiveMontageUnitTests(unittest.TestCase):
             ])
 
             self.assertEqual(exit_code, 0)
-            with sqlite3.connect(db) as conn:
+            with closing(sqlite3.connect(db)) as conn:
                 names = {row[0] for row in conn.execute("SELECT name FROM files")}
                 scans_count = conn.execute("SELECT COUNT(*) FROM scans").fetchone()[0]
             self.assertIn("café 😀.txt", names)
