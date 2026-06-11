@@ -621,7 +621,7 @@ def generate_video_montage(conn: sqlite3.Connection, scan_id: str, source_file_i
     out_dir.mkdir(parents=True, exist_ok=True)
     out_pattern = out_dir / f"{video.name}.%03d.jpg"
     vf = f"thumbnail={options.video_fps},scale={options.video_scale_width}:-1,tile={options.video_tile}"
-    args = ["-hide_banner", "-n", "-i", str(video), "-vf", vf, "-frames:v", "1", str(out_pattern)]
+    args = ["-n", "-i", str(video), "-vf", vf, "-frames:v", "1", str(out_pattern)]
     if options.dry_run:
         result = subprocess.CompletedProcess([options.ffmpeg, *args], 0, "DRY RUN", "")
     else:
@@ -742,7 +742,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ffmpeg", default="ffmpeg", help="ffmpeg executable name/path.")
     parser.add_argument("--ffprobe", default="ffprobe", help="ffprobe executable name/path.")
     parser.add_argument("--magick", default="magick", help="ImageMagick executable name/path.")
-    parser.add_argument("--timeout", type=int, default=1800, help="Per-command timeout in seconds. Default: 1800.")
+    parser.add_argument("--timeout", type=int, default=3600, help="Per-command timeout in seconds. Default: 3600.")
     parser.add_argument("--include-exts", default=",".join(sorted(VIDEO_EXTENSIONS | IMAGE_EXTENSIONS)), help="Comma-separated extension allowlist, e.g. .mp4,.jpg")
     parser.add_argument("--exclude-exts", default=",".join(sorted(DEFAULT_EXCLUDE_EXTENSIONS)), help="Comma-separated extension blocklist.")
     parser.add_argument("--exclude-names", default=",".join(sorted(DEFAULT_EXCLUDE_NAMES)), help="Comma-separated filename blocklist.")
