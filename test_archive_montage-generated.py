@@ -79,6 +79,34 @@ class ArchiveMontageUnitTests(unittest.TestCase):
             child = root / "folder" / "file.txt"
             self.assertEqual(am.safe_relative(child, root), os.path.join("folder", "file.txt"))
 
+    def test_path_text_strips_windows_extended_length_prefixes(self):
+        self.assertEqual(am.path_text(r"\\?\C:\folder\file.txt"), r"C:\folder\file.txt")
+        self.assertEqual(am.path_text(r"\\?\UNC\server\share\file.txt"), r"\\server\share\file.txt")
+
+    @unittest.skipUnless(os.name == "nt", "Windows long-path prefix behavior")
+    def test_native_path_prefixes_long_windows_paths_only_at_boundaries(self):
+        base = Path(tempfile.gettempdir()).resolve()
+        long_path = base / ("a" * 120) / ("b" * 120) / "file.txt"
+
+        native = am.native_path(long_path)
+
+        self.assertTrue(native.startswith(am.WINDOWS_LONG_PATH_PREFIX))
+        self.assertEqual(am.path_text(native), str(long_path))
+
+    @unittest.skipUnless(os.name == "nt", "Windows long-path prefix behavior")
+    def test_native_command_args_use_extended_paths_for_long_inputs(self):
+        base = Path(tempfile.gettempdir()).resolve()
+        video = base / ("v" * 120) / ("x" * 120) / "video.mp4"
+        out_file = base / ("o" * 120) / ("y" * 120) / "sheet.jpg"
+
+        ffmpeg_args = am.build_ffmpeg_thumbnail_args(video, out_file, 200, 1.0, overlay_timestamp=False)
+        magick_args = am.build_magick_video_sheet_args([video], [1.0], "1x1", out_file, labels_needed=True)
+
+        self.assertIn(am.native_path(video), ffmpeg_args)
+        self.assertEqual(ffmpeg_args[-1], am.native_path(out_file))
+        self.assertIn(am.native_path(video), magick_args)
+        self.assertEqual(magick_args[-1], am.native_path(out_file))
+
     def test_hash_functions_match_hashlib(self):
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "café 😀.txt"
@@ -131,7 +159,7 @@ class ArchiveMontageUnitTests(unittest.TestCase):
             self.assertFalse(am.should_include(root / "notes.txt", options))
 
     def test_init_db_creates_expected_tables(self):
-        with sqlite3.connect(":memory:") as conn:
+        with closing(sqlite3.connect(":memory:")) as conn:
             am.init_db(conn)
             table_names = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
             self.assertTrue({"scans", "files", "media_metadata", "generated_artifacts"}.issubset(table_names))
@@ -146,7 +174,7 @@ class ArchiveMontageUnitTests(unittest.TestCase):
             path.write_bytes(payload)
 
             options = self.make_options(root)
-            with sqlite3.connect(":memory:") as conn:
+            with closing(sqlite3.connect(":memory:")) as conn:
                 am.init_db(conn)
                 conn.execute(
                     "INSERT INTO scans (id, scan_started_utc, root_path, scanner_version) VALUES (?, ?, ?, ?)",
@@ -171,7 +199,7 @@ class ArchiveMontageUnitTests(unittest.TestCase):
             path = root / "file.bin"
             path.write_bytes(b"abc")
             options = self.make_options(root, no_hash=True)
-            with sqlite3.connect(":memory:") as conn:
+            with closing(sqlite3.connect(":memory:")) as conn:
                 am.init_db(conn)
                 conn.execute(
                     "INSERT INTO scans (id, scan_started_utc, root_path, scanner_version) VALUES (?, ?, ?, ?)",
@@ -200,7 +228,7 @@ class ArchiveMontageUnitTests(unittest.TestCase):
             video = root / "動画.mp4"
             video.write_bytes(b"not a real video")
             options = self.make_options(root, scan_only=False, no_video_montage=False, dry_run=True)
-            with sqlite3.connect(":memory:") as conn:
+            with closing(sqlite3.connect(":memory:")) as conn:
                 am.init_db(conn)
                 conn.execute(
                     "INSERT INTO scans (id, scan_started_utc, root_path, scanner_version) VALUES (?, ?, ?, ?)",

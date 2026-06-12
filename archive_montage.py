@@ -59,6 +59,9 @@ DEFAULT_EXCLUDE_EXTENSIONS = {
 }
 
 ProgressCallback = Callable[[str], None]
+WINDOWS_LONG_PATH_THRESHOLD = 240
+WINDOWS_LONG_PATH_PREFIX = "\\\\?\\"
+WINDOWS_LONG_UNC_PREFIX = "\\\\?\\UNC\\"
 
 
 def utc_now_iso() -> str:
@@ -74,20 +77,106 @@ def iso_from_timestamp(value: Optional[float]) -> Optional[str]:
         return None
 
 
-def path_text(path: Path) -> str:
-    return str(path)
+def strip_windows_long_path_prefix(value: str) -> str:
+    if value.startswith(WINDOWS_LONG_UNC_PREFIX):
+        return "\\\\" + value[len(WINDOWS_LONG_UNC_PREFIX):]
+    if value.startswith(WINDOWS_LONG_PATH_PREFIX):
+        return value[len(WINDOWS_LONG_PATH_PREFIX):]
+    return value
+
+
+def path_text(path: Path | str) -> str:
+    return strip_windows_long_path_prefix(str(path))
+
+
+def safe_resolve_path(path: Path) -> Path:
+    try:
+        return Path(path_text(path.expanduser().resolve(strict=False)))
+    except OSError:
+        return Path(path_text(path.expanduser().absolute()))
+
+
+def _absolute_path_text(path: Path | str) -> str:
+    value = Path(path_text(path)).expanduser()
+    try:
+        absolute = value if value.is_absolute() else value.absolute()
+    except OSError:
+        absolute = Path(os.path.abspath(path_text(value)))
+    return path_text(absolute)
+
+
+def windows_extended_path(path: Path | str) -> str:
+    value = path_text(path)
+    if value.startswith(WINDOWS_LONG_PATH_PREFIX):
+        return value
+    absolute = _absolute_path_text(value)
+    if absolute.startswith("\\\\"):
+        return WINDOWS_LONG_UNC_PREFIX + absolute[2:]
+    return WINDOWS_LONG_PATH_PREFIX + absolute
+
+
+def native_path(path: Path | str, *, force_long: bool = False) -> str:
+    value = path_text(path)
+    if os.name != "nt":
+        return value
+    absolute = _absolute_path_text(value)
+    if force_long or len(absolute) >= WINDOWS_LONG_PATH_THRESHOLD:
+        return windows_extended_path(absolute)
+    return value
+
+
+def comparable_path_text(path: Path | str) -> str:
+    try:
+        resolved = safe_resolve_path(Path(path_text(path)))
+    except OSError:
+        resolved = Path(_absolute_path_text(path))
+    value = os.path.normpath(path_text(resolved))
+    if os.name == "nt":
+        value = os.path.normcase(value)
+    return value
 
 
 def safe_relative(path: Path, root: Path) -> str:
     try:
-        return str(path.relative_to(root))
+        return path_text(path.relative_to(root))
     except ValueError:
-        return str(path)
+        return path_text(path)
+
+
+def path_lstat(path: Path) -> os.stat_result:
+    return os.lstat(native_path(path))
+
+
+def path_exists(path: Path) -> bool:
+    return os.path.exists(native_path(path))
+
+
+def path_is_file(path: Path) -> bool:
+    return os.path.isfile(native_path(path))
+
+
+def path_is_dir(path: Path) -> bool:
+    return os.path.isdir(native_path(path))
+
+
+def path_is_symlink(path: Path) -> bool:
+    return os.path.islink(native_path(path))
+
+
+def ensure_dir(path: Path) -> None:
+    os.makedirs(native_path(path), exist_ok=True)
+
+
+def safe_readlink(path: Path) -> Optional[str]:
+    try:
+        return path_text(os.readlink(native_path(path)))
+    except OSError:
+        return None
 
 
 def sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
     digest = hashlib.sha256()
-    with path.open("rb") as f:
+    with open(native_path(path), "rb") as f:
         for chunk in iter(lambda: f.read(chunk_size), b""):
             digest.update(chunk)
     return digest.hexdigest()
@@ -95,7 +184,7 @@ def sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
 
 def blake2b_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
     digest = hashlib.blake2b()
-    with path.open("rb") as f:
+    with open(native_path(path), "rb") as f:
         for chunk in iter(lambda: f.read(chunk_size), b""):
             digest.update(chunk)
     return digest.hexdigest()
@@ -108,17 +197,21 @@ def run_native(
     timeout: Optional[int] = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run a native command with argument-array semantics and UTF-8 text capture."""
-    return subprocess.run(
-        [exe, *args],
-        cwd=str(cwd) if cwd else None,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=timeout,
-        check=False,
-    )
+    command = [exe, *args]
+    try:
+        return subprocess.run(
+            command,
+            cwd=native_path(cwd) if cwd else None,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return subprocess.CompletedProcess(command, 1, "", repr(exc))
 
 
 def command_available(name: str) -> bool:
@@ -147,7 +240,7 @@ def get_owner_group(path: Path) -> tuple[Optional[str], Optional[str], Optional[
     owner = group = None
     uid = gid = None
     try:
-        st = path.lstat()
+        st = path_lstat(path)
         uid = getattr(st, "st_uid", None)
         gid = getattr(st, "st_gid", None)
         if os.name != "nt":
@@ -174,7 +267,7 @@ def ffprobe_json(path: Path, ffprobe_exe: str, timeout: int) -> Optional[dict]:
             "-print_format", "json",
             "-show_format",
             "-show_streams",
-            str(path),
+            native_path(path),
         ],
         timeout=timeout,
     )
@@ -190,7 +283,7 @@ def magick_identify_json(path: Path, magick_exe: str, timeout: int) -> Optional[
     # ImageMagick v7 usually supports JSON via identify -format %j.
     result = run_native(
         magick_exe,
-        ["identify", "-format", "%j", str(path)],
+        ["identify", "-format", "%j", native_path(path)],
         timeout=timeout,
     )
     if result.returncode != 0 or not result.stdout.strip():
@@ -393,19 +486,23 @@ class Options:
 
 
 def is_relative_to(path: Path, parent: Path) -> bool:
+    path_value = comparable_path_text(path)
+    parent_value = comparable_path_text(parent)
     try:
-        path.resolve().relative_to(parent.resolve())
-        return True
+        return os.path.commonpath([path_value, parent_value]) == parent_value
     except ValueError:
         return False
 
 
 def should_include(path: Path, options: Options) -> bool:
     try:
-        resolved = path.resolve()
-        db_resolved = options.db.resolve()
-        db_sidecars = {db_resolved.with_name(db_resolved.name + suffix) for suffix in ("-wal", "-shm", "-journal")}
-        if resolved == db_resolved or resolved in db_sidecars or is_relative_to(resolved, options.output_dir):
+        resolved = comparable_path_text(path)
+        db_resolved = comparable_path_text(options.db)
+        db_sidecars = {
+            comparable_path_text(options.db.with_name(options.db.name + suffix))
+            for suffix in ("-wal", "-shm", "-journal")
+        }
+        if resolved == db_resolved or resolved in db_sidecars or is_relative_to(path, options.output_dir):
             return False
     except OSError:
         pass
@@ -422,28 +519,38 @@ def should_include(path: Path, options: Options) -> bool:
 
 
 def iter_paths(root: Path, recursive: bool) -> Iterable[Path]:
-    if recursive:
-        yield from root.rglob("*")
-    else:
-        yield from root.iterdir()
+    def walk(directory: Path) -> Iterable[Path]:
+        try:
+            with os.scandir(native_path(directory)) as entries:
+                for entry in entries:
+                    child = Path(path_text(entry.path))
+                    yield child
+                    if recursive:
+                        try:
+                            is_dir = entry.is_dir(follow_symlinks=False)
+                        except OSError:
+                            is_dir = path_is_dir(child)
+                        if is_dir:
+                            yield from walk(child)
+        except OSError as exc:
+            print(f"Skipping unreadable directory: {directory} ({exc})", file=sys.stderr, flush=True)
+
+    yield from walk(root)
 
 
 def insert_file_record(conn: sqlite3.Connection, scan_id: str, root: Path, path: Path, options: Options) -> int:
     scan_time = utc_now_iso()
     try:
-        st = path.lstat()
+        st = path_lstat(path)
         birth_ts, birth_available = file_birth_time(st)
         meta_ts = metadata_changed_time(st)
         owner, group, uid, gid = get_owner_group(path)
-        is_file = path.is_file()
-        is_dir = path.is_dir()
-        is_symlink = path.is_symlink()
+        is_file = path_is_file(path)
+        is_dir = path_is_dir(path)
+        is_symlink = path_is_symlink(path)
         link_target = None
         if is_symlink:
-            try:
-                link_target = os.readlink(path)
-            except OSError:
-                link_target = None
+            link_target = safe_readlink(path)
 
         sha256 = None
         blake2b = None
@@ -698,8 +805,8 @@ def ffmpeg_drawtext_fontfile() -> Optional[str]:
     windir = Path(os.environ.get("WINDIR", r"C:\Windows"))
     for font_name in ("arial.ttf", "segoeui.ttf", "calibri.ttf"):
         font_file = windir / "Fonts" / font_name
-        if font_file.exists():
-            return str(font_file)
+        if path_exists(font_file):
+            return native_path(font_file)
     return None
 
 
@@ -739,7 +846,7 @@ def build_ffmpeg_video_sheet_args(
     args: list[str] = ["-hide_banner", "-y"]
     labels = [format_ffmpeg_timestamp(timestamp) for timestamp in timestamps]
     for label in labels:
-        args.extend(["-ss", label, "-i", str(video)])
+        args.extend(["-ss", label, "-i", native_path(video)])
 
     filter_parts: list[str] = []
     concat_inputs: list[str] = []
@@ -759,7 +866,7 @@ def build_ffmpeg_video_sheet_args(
         "-map", "[out]",
         "-frames:v", "1",
         "-update", "1",
-        str(out_file),
+        native_path(out_file),
     ])
     return args
 
@@ -778,12 +885,12 @@ def build_ffmpeg_thumbnail_args(
     return [
         "-hide_banner", "-y",
         "-ss", label,
-        "-i", str(video),
+        "-i", native_path(video),
         "-map", "0:v:0",
         "-frames:v", "1",
         "-update", "1",
         "-vf", vf,
-        str(out_file),
+        native_path(out_file),
     ]
 
 
@@ -798,14 +905,14 @@ def build_magick_video_sheet_args(
     if labels_needed:
         args.extend(["-background", "#000000", "-fill", "white", "-pointsize", "14"])
         for thumb, timestamp in zip(thumb_files, timestamps):
-            args.extend(["-label", format_ffmpeg_timestamp(timestamp), str(thumb)])
+            args.extend(["-label", format_ffmpeg_timestamp(timestamp), native_path(thumb)])
     else:
-        args.extend(str(thumb) for thumb in thumb_files)
+        args.extend(native_path(thumb) for thumb in thumb_files)
     args.extend([
         "-mode", "concatenate",
         "-tile", tile,
         "-background", "#000000",
-        str(out_file),
+        native_path(out_file),
     ])
     return args
 
@@ -879,7 +986,7 @@ def insert_generated_artifact(
             scan_id,
             source_file_id,
             artifact_type,
-            str(artifact_path),
+            path_text(artifact_path),
             json.dumps(command, ensure_ascii=False),
             result.returncode,
             result.stdout,
@@ -902,7 +1009,7 @@ def generate_video_thumbnail_sheet(
             [],
         )
 
-    out_file.parent.mkdir(parents=True, exist_ok=True)
+    ensure_dir(out_file.parent)
     try:
         columns, rows = parse_tile_dimensions(options.video_tile)
     except ValueError as exc:
@@ -1024,19 +1131,19 @@ def generate_image_montage_page(
     if not page_files or not command_available(options.magick):
         return
     out_dir = artifact_dir_for(source_dir, root, options.output_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    ensure_dir(out_dir)
     out_file = out_dir / f"montage-{page_num:03d}.jpg"
     args: list[str] = ["montage"]
     for image in page_files:
         # ImageMagick geometry suffix is intentionally a separate path-like token.
-        args.append(f"{image}[{options.image_geometry}]")
+        args.append(f"{native_path(image)}[{options.image_geometry}]")
     args.extend([
         "-auto-orient",
         "-mode", "concatenate",
         "-set", "label", "%f",
         "-tile", options.image_tile,
         "-background", "#AB82FF",
-        str(out_file),
+        native_path(out_file),
     ])
     if options.dry_run:
         result = subprocess.CompletedProcess([options.magick, *args], 0, "DRY RUN", "")
@@ -1051,7 +1158,7 @@ def generate_image_montage_page(
         (
             scan_id,
             "image_montage",
-            str(out_file),
+            path_text(out_file),
             json.dumps([options.magick, *args], ensure_ascii=False),
             result.returncode,
             result.stdout,
@@ -1191,21 +1298,21 @@ def options_from_args(args: argparse.Namespace, root: Path, db: Path, output_dir
 
 def output_path_for_single_video(args: argparse.Namespace, video: Path) -> Path:
     if args.video_output is not None:
-        return args.video_output.expanduser().resolve()
+        return safe_resolve_path(args.video_output)
     if args.output_dir is not None:
-        return (args.output_dir.expanduser().resolve() / f"{video.name}.jpg").resolve()
-    return video.with_name(f"{video.name}.jpg").resolve()
+        return safe_resolve_path(safe_resolve_path(args.output_dir) / f"{video.name}.jpg")
+    return safe_resolve_path(video.with_name(f"{video.name}.jpg"))
 
 
 def generate_single_video_sheet(args: argparse.Namespace) -> int:
-    video = args.video_file.expanduser().resolve()
-    if not video.is_file():
+    video = safe_resolve_path(args.video_file)
+    if not path_is_file(video):
         print(f"Video file is not a file: {video}", file=sys.stderr)
         return 2
 
-    root = args.root.expanduser().resolve() if args.root else video.parent
-    db = (args.db or (root / "archive_inventory.sqlite")).expanduser().resolve()
-    output_dir = args.output_dir.expanduser().resolve() if args.output_dir else video.parent
+    root = safe_resolve_path(args.root) if args.root else video.parent
+    db = safe_resolve_path(args.db or (root / "archive_inventory.sqlite"))
+    output_dir = safe_resolve_path(args.output_dir) if args.output_dir else video.parent
     out_file = output_path_for_single_video(args, video)
     options = options_from_args(args, root, db, output_dir)
 
@@ -1237,15 +1344,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print("Root is required unless --video-file is used.", file=sys.stderr)
         return 2
 
-    root = args.root.expanduser().resolve()
-    if not root.is_dir():
+    root = safe_resolve_path(args.root)
+    if not path_is_dir(root):
         print(f"Root is not a directory: {root}", file=sys.stderr)
         return 2
 
-    db = (args.db or (root / "archive_inventory.sqlite")).expanduser().resolve()
-    output_dir = (args.output_dir or (root / "Montages")).expanduser().resolve()
-    db.parent.mkdir(parents=True, exist_ok=True)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    db = safe_resolve_path(args.db or (root / "archive_inventory.sqlite"))
+    output_dir = safe_resolve_path(args.output_dir or (root / "Montages"))
+    ensure_dir(db.parent)
+    ensure_dir(output_dir)
 
     options = options_from_args(args, root, db, output_dir)
 
@@ -1254,7 +1361,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     image_montages = ImageMontageState()
     count = 0
 
-    with closing(sqlite3.connect(db)) as conn:
+    with closing(sqlite3.connect(native_path(db))) as conn:
         conn.execute("PRAGMA foreign_keys=ON")
         init_db(conn)
         conn.execute(
@@ -1267,7 +1374,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             (
                 scan_id,
                 started,
-                str(root),
+                path_text(root),
                 SCANNER_VERSION,
                 socket.gethostname(),
                 getpass.getuser(),
@@ -1283,13 +1390,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         for path in iter_paths(root, options.recursive):
             if not should_include(path, options):
                 continue
-            if not path.exists() and not path.is_symlink():
+            if not path_exists(path) and not path_is_symlink(path):
                 continue
             file_id = insert_file_record(conn, scan_id, root, path, options)
             if file_id == 0:
                 continue
             count += 1
-            if path.is_file():
+            if path_is_file(path):
                 ext = path.suffix.lower()
                 if not options.montage_only:
                     insert_media_metadata(conn, file_id, path, options)
