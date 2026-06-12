@@ -236,13 +236,14 @@ class ArchiveMontageUnitTests(unittest.TestCase):
             video.write_bytes(b"not a real video")
             observed: dict[str, object] = {}
 
-            def fake_generate(video_arg, out_arg, options, duration_seconds=None):
+            def fake_generate(video_arg, out_arg, options, duration_seconds=None, progress=None):
                 observed["video"] = video_arg
                 observed["out"] = out_arg
                 observed["root"] = options.root
                 observed["tile"] = options.video_tile
                 observed["width"] = options.video_scale_width
                 observed["duration"] = duration_seconds
+                observed["progress"] = callable(progress)
                 return subprocess.CompletedProcess(["ffmpeg"], 0, "", ""), ["ffmpeg"]
 
             with patch.object(am, "init_db", side_effect=AssertionError("direct mode should not initialize SQLite")):
@@ -261,6 +262,7 @@ class ArchiveMontageUnitTests(unittest.TestCase):
             self.assertEqual(observed["tile"], "2x2")
             self.assertEqual(observed["width"], 123)
             self.assertIsNone(observed["duration"])
+            self.assertTrue(observed["progress"])
 
     def test_main_generates_video_montages_during_single_scan_pass(self):
         with tempfile.TemporaryDirectory() as td:

@@ -36,9 +36,9 @@ from contextlib import closing
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable, Optional, Sequence
+from typing import Callable, Iterable, Optional, Sequence
 
-SCANNER_VERSION = "2026.06.12-2"
+SCANNER_VERSION = "2026.06.12-3"
 
 VIDEO_EXTENSIONS = {
     ".mp4", ".m4v", ".mov", ".mkv", ".avi", ".wmv", ".webm", ".flv",
@@ -57,6 +57,8 @@ DEFAULT_EXCLUDE_NAMES = {
 DEFAULT_EXCLUDE_EXTENSIONS = {
     ".db", ".sqlite", ".sqlite3", ".ini", ".xml", ".7z", ".zip",".py",".ps1",".git",".md"
 }
+
+ProgressCallback = Callable[[str], None]
 
 
 def utc_now_iso() -> str:
@@ -815,6 +817,7 @@ def generate_video_sheet_with_magick_fallback(
     tile: str,
     timestamps: Sequence[float],
     options: Options,
+    progress: Optional[ProgressCallback] = None,
 ) -> tuple[subprocess.CompletedProcess[str], list[list[str]]]:
     commands: list[list[str]] = []
     with tempfile.TemporaryDirectory(prefix="archive-montage-video-") as tmp:
@@ -825,8 +828,13 @@ def generate_video_sheet_with_magick_fallback(
         overlay_timestamp = True
         for attempt in range(2):
             overlay_timestamp = attempt == 0
+            if progress is not None:
+                suffix = " with timestamp overlay" if overlay_timestamp else " without timestamp overlay"
+                progress(f"Fallback: extracting {len(timestamps)} thumbnails{suffix}")
             failed = False
-            for thumb_file, timestamp in zip(thumb_files, timestamps):
+            for index, (thumb_file, timestamp) in enumerate(zip(thumb_files, timestamps), start=1):
+                if progress is not None:
+                    progress(f"Fallback thumbnail {index}/{len(timestamps)} at {format_ffmpeg_timestamp(timestamp)}\r")
                 thumb_args = build_ffmpeg_thumbnail_args(video, thumb_file, thumbnail_width, timestamp, overlay_timestamp)
                 commands.append([options.ffmpeg, *thumb_args])
                 result = run_native_result(options.ffmpeg, thumb_args, timeout=options.timeout)
@@ -838,6 +846,8 @@ def generate_video_sheet_with_magick_fallback(
         else:
             return result, commands
 
+        if progress is not None:
+            progress("Fallback: assembling sheet with ImageMagick")
         magick_args = build_magick_video_sheet_args(
             thumb_files,
             timestamps,
@@ -884,6 +894,7 @@ def generate_video_thumbnail_sheet(
     out_file: Path,
     options: Options,
     duration_seconds: Optional[float] = None,
+    progress: Optional[ProgressCallback] = None,
 ) -> tuple[subprocess.CompletedProcess[str], object]:
     if not command_available(options.ffmpeg):
         return (
@@ -899,6 +910,8 @@ def generate_video_thumbnail_sheet(
 
     thumbnail_count = columns * rows
     if duration_seconds is None:
+        if progress is not None:
+            progress("Reading video duration with ffprobe")
         duration_seconds = float(thumbnail_count) if options.dry_run else probe_video_duration_seconds(video, options)
     if duration_seconds is None:
         return (
@@ -912,6 +925,11 @@ def generate_video_thumbnail_sheet(
         )
 
     timestamps, step_seconds = video_montage_timestamps(duration_seconds, thumbnail_count)
+    if progress is not None:
+        progress(
+            f"Preparing {thumbnail_count} thumbnails "
+            f"({columns}x{rows}, step {step_seconds:.6f}s, width {options.video_scale_width}px)"
+        )
     args = build_ffmpeg_video_sheet_args(
         video,
         out_file,
@@ -920,11 +938,17 @@ def generate_video_thumbnail_sheet(
         timestamps,
     )
     if options.dry_run:
+        if progress is not None:
+            progress("Dry run: built direct FFmpeg sheet command")
         return subprocess.CompletedProcess([options.ffmpeg, *args], 0, "DRY RUN", ""), [options.ffmpeg, *args]
 
+    if progress is not None:
+        progress("Generating sheet with FFmpeg")
     result = run_native_result(options.ffmpeg, args, timeout=options.timeout)
     command: object = [options.ffmpeg, *args]
     if result.returncode != 0 and command_available(options.magick):
+        if progress is not None:
+            progress("Direct FFmpeg sheet failed; trying FFmpeg thumbnails plus ImageMagick")
         fallback_result, fallback_commands = generate_video_sheet_with_magick_fallback(
             video,
             out_file,
@@ -932,6 +956,7 @@ def generate_video_thumbnail_sheet(
             options.video_tile,
             timestamps,
             options,
+            progress,
         )
         command = {
             "direct_ffmpeg": [options.ffmpeg, *args],
@@ -945,6 +970,11 @@ def generate_video_thumbnail_sheet(
             "\n".join(part for part in (result.stderr, fallback_result.stderr) if part),
         )
 
+    if progress is not None:
+        if result.returncode == 0:
+            progress("Thumbnail sheet complete")
+        else:
+            progress("Thumbnail sheet failed")
     return result, command
 
 
@@ -956,7 +986,13 @@ def generate_video_montage(conn: sqlite3.Connection, scan_id: str, source_file_i
     out_dir = artifact_dir_for(video.parent, root, options.output_dir)
     out_file = out_dir / f"{video.name}.jpg"
     duration_seconds = video_duration_seconds(conn, source_file_id, video, options)
-    result, command = generate_video_thumbnail_sheet(video, out_file, options, duration_seconds)
+    result, command = generate_video_thumbnail_sheet(
+        video,
+        out_file,
+        options,
+        duration_seconds,
+        progress=lambda message: print(f"  {message}", flush=True),
+    )
     insert_generated_artifact(
         conn,
         scan_id,
@@ -1173,7 +1209,12 @@ def generate_single_video_sheet(args: argparse.Namespace) -> int:
     out_file = output_path_for_single_video(args, video)
     options = options_from_args(args, root, db, output_dir)
 
-    result, command = generate_video_thumbnail_sheet(video, out_file, options)
+    result, command = generate_video_thumbnail_sheet(
+        video,
+        out_file,
+        options,
+        progress=lambda message: print(f"[video] {message}", flush=True),
+    )
     if args.dry_run:
         print(json.dumps(command, ensure_ascii=False, indent=2))
     if result.stdout.strip():
