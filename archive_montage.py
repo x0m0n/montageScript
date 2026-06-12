@@ -29,6 +29,7 @@ import sqlite3
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 from contextlib import closing
@@ -37,7 +38,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Optional, Sequence
 
-SCANNER_VERSION = "2026.06.06-1"
+SCANNER_VERSION = "2026.06.12-2"
 
 VIDEO_EXTENSIONS = {
     ".mp4", ".m4v", ".mov", ".mkv", ".avi", ".wmv", ".webm", ".flv",
@@ -620,20 +621,244 @@ def artifact_dir_for(source_dir: Path, root: Path, output_dir: Path) -> Path:
     return output_dir / safe_rel / "montages"
 
 
-def generate_video_montage(conn: sqlite3.Connection, scan_id: str, source_file_id: int, video: Path, root: Path, options: Options) -> None:
-    if options.no_video_montage or options.scan_only:
-        return
-    if not command_available(options.ffmpeg):
-        return
-    out_dir = artifact_dir_for(video.parent, root, options.output_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out_pattern = out_dir / f"{video.name}.%03d.jpg"
-    vf = f"framestep={options.video_fps},scale={options.video_scale_width}:-1,tile={options.video_tile}"
-    args = ["-hide_banner", "-y", "-i", str(video), "-vf", vf, str(out_pattern)]
-    if options.dry_run:
-        result = subprocess.CompletedProcess([options.ffmpeg, *args], 0, "DRY RUN", "")
+def parse_tile_dimensions(tile: str) -> tuple[int, int]:
+    parts = tile.lower().split("x", 1)
+    if len(parts) != 2:
+        raise ValueError(f"Tile must be formatted as COLUMNSxROWS, got: {tile!r}")
+    try:
+        columns = int(parts[0])
+        rows = int(parts[1])
+    except ValueError as exc:
+        raise ValueError(f"Tile must contain integer dimensions, got: {tile!r}") from exc
+    if columns < 1 or rows < 1:
+        raise ValueError(f"Tile dimensions must be positive, got: {tile!r}")
+    return columns, rows
+
+
+def probe_video_duration_seconds(video: Path, options: Options) -> Optional[float]:
+    if options.no_ffprobe or not command_available(options.ffprobe):
+        return None
+    probe = ffprobe_json(video, options.ffprobe, options.timeout)
+    duration = _float_or_none(extract_media_summary(probe)["duration_seconds"])
+    if duration is not None and duration > 0:
+        return duration
+    return None
+
+
+def video_duration_seconds(conn: sqlite3.Connection, source_file_id: int, video: Path, options: Options) -> Optional[float]:
+    row = conn.execute(
+        "SELECT duration_seconds FROM media_metadata WHERE file_id=?",
+        (source_file_id,),
+    ).fetchone()
+    if row is not None:
+        duration = _float_or_none(row[0])
+        if duration is not None and duration > 0:
+            return duration
+
+    if options.dry_run or options.no_ffprobe or not command_available(options.ffprobe):
+        return None
+
+    return probe_video_duration_seconds(video, options)
+
+
+def video_montage_timestamps(duration_seconds: float, thumbnail_count: int) -> tuple[list[float], float]:
+    step_seconds = max(0.000001, round(duration_seconds / thumbnail_count, 6))
+    max_timestamp = max(0.0, duration_seconds - 0.000001)
+    timestamps = [min(round(i * step_seconds, 6), max_timestamp) for i in range(thumbnail_count)]
+    return timestamps, step_seconds
+
+
+def format_ffmpeg_timestamp(seconds: float) -> str:
+    seconds = max(0.0, seconds)
+    whole_seconds = int(seconds)
+    microseconds = int(round((seconds - whole_seconds) * 1_000_000))
+    if microseconds == 1_000_000:
+        whole_seconds += 1
+        microseconds = 0
+    hours, remainder = divmod(whole_seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}.{microseconds:06d}"
+
+
+def ffmpeg_filter_escape(value: str) -> str:
+    return (
+        value
+        .replace("\\", "/")
+        .replace("\\", "\\\\")
+        .replace(":", "\\:")
+        .replace("'", "\\'")
+    )
+
+
+def ffmpeg_drawtext_fontfile() -> Optional[str]:
+    if platform.system().lower() != "windows":
+        return None
+    windir = Path(os.environ.get("WINDIR", r"C:\Windows"))
+    for font_name in ("arial.ttf", "segoeui.ttf", "calibri.ttf"):
+        font_file = windir / "Fonts" / font_name
+        if font_file.exists():
+            return str(font_file)
+    return None
+
+
+def ffmpeg_drawtext_filter(label: str, width: int) -> str:
+    escaped_label = ffmpeg_filter_escape(label)
+    fontfile = ffmpeg_drawtext_fontfile()
+    fontfile_option = f"fontfile='{ffmpeg_filter_escape(fontfile)}':" if fontfile else ""
+    font_size = max(12, min(32, width // 18))
+    return (
+        "drawtext="
+        f"{fontfile_option}"
+        f"text='{escaped_label}':"
+        f"fontsize={font_size}:"
+        "fontcolor=white:"
+        "box=1:"
+        "boxcolor=black@0.65:"
+        "boxborderw=4:"
+        "x=6:"
+        "y=h-th-6"
+    )
+
+
+def run_native_result(exe: str, args: Sequence[str], timeout: Optional[int] = None) -> subprocess.CompletedProcess[str]:
+    try:
+        return run_native(exe, args, timeout=timeout)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return subprocess.CompletedProcess([exe, *args], 1, "", repr(exc))
+
+
+def build_ffmpeg_video_sheet_args(
+    video: Path,
+    out_file: Path,
+    thumbnail_width: int,
+    tile: str,
+    timestamps: Sequence[float],
+) -> list[str]:
+    args: list[str] = ["-hide_banner", "-y"]
+    labels = [format_ffmpeg_timestamp(timestamp) for timestamp in timestamps]
+    for label in labels:
+        args.extend(["-ss", label, "-i", str(video)])
+
+    filter_parts: list[str] = []
+    concat_inputs: list[str] = []
+    for index, label in enumerate(labels):
+        out_name = f"v{index}"
+        filter_parts.append(
+            f"[{index}:v]trim=end_frame=1,setpts=PTS-STARTPTS,"
+            f"scale={thumbnail_width}:-1,{ffmpeg_drawtext_filter(label, thumbnail_width)}[{out_name}]"
+        )
+        concat_inputs.append(f"[{out_name}]")
+    filter_parts.append(
+        f"{''.join(concat_inputs)}concat=n={len(timestamps)}:v=1:a=0,"
+        f"tile={tile}[out]"
+    )
+    args.extend([
+        "-filter_complex", ";".join(filter_parts),
+        "-map", "[out]",
+        "-frames:v", "1",
+        "-update", "1",
+        str(out_file),
+    ])
+    return args
+
+
+def build_ffmpeg_thumbnail_args(
+    video: Path,
+    out_file: Path,
+    thumbnail_width: int,
+    timestamp: float,
+    overlay_timestamp: bool,
+) -> list[str]:
+    label = format_ffmpeg_timestamp(timestamp)
+    vf = f"scale={thumbnail_width}:-1"
+    if overlay_timestamp:
+        vf = f"{vf},{ffmpeg_drawtext_filter(label, thumbnail_width)}"
+    return [
+        "-hide_banner", "-y",
+        "-ss", label,
+        "-i", str(video),
+        "-map", "0:v:0",
+        "-frames:v", "1",
+        "-update", "1",
+        "-vf", vf,
+        str(out_file),
+    ]
+
+
+def build_magick_video_sheet_args(
+    thumb_files: Sequence[Path],
+    timestamps: Sequence[float],
+    tile: str,
+    out_file: Path,
+    labels_needed: bool,
+) -> list[str]:
+    args: list[str] = ["montage"]
+    if labels_needed:
+        args.extend(["-background", "#000000", "-fill", "white", "-pointsize", "14"])
+        for thumb, timestamp in zip(thumb_files, timestamps):
+            args.extend(["-label", format_ffmpeg_timestamp(timestamp), str(thumb)])
     else:
-        result = run_native(options.ffmpeg, args, timeout=options.timeout)
+        args.extend(str(thumb) for thumb in thumb_files)
+    args.extend([
+        "-mode", "concatenate",
+        "-tile", tile,
+        "-background", "#000000",
+        str(out_file),
+    ])
+    return args
+
+
+def generate_video_sheet_with_magick_fallback(
+    video: Path,
+    out_file: Path,
+    thumbnail_width: int,
+    tile: str,
+    timestamps: Sequence[float],
+    options: Options,
+) -> tuple[subprocess.CompletedProcess[str], list[list[str]]]:
+    commands: list[list[str]] = []
+    with tempfile.TemporaryDirectory(prefix="archive-montage-video-") as tmp:
+        tmp_dir = Path(tmp)
+        thumb_files = [tmp_dir / f"thumb-{index + 1:03d}.jpg" for index in range(len(timestamps))]
+
+        result: subprocess.CompletedProcess[str] = subprocess.CompletedProcess([], 0, "", "")
+        overlay_timestamp = True
+        for attempt in range(2):
+            overlay_timestamp = attempt == 0
+            failed = False
+            for thumb_file, timestamp in zip(thumb_files, timestamps):
+                thumb_args = build_ffmpeg_thumbnail_args(video, thumb_file, thumbnail_width, timestamp, overlay_timestamp)
+                commands.append([options.ffmpeg, *thumb_args])
+                result = run_native_result(options.ffmpeg, thumb_args, timeout=options.timeout)
+                if result.returncode != 0:
+                    failed = True
+                    break
+            if not failed:
+                break
+        else:
+            return result, commands
+
+        magick_args = build_magick_video_sheet_args(
+            thumb_files,
+            timestamps,
+            tile,
+            out_file,
+            labels_needed=not overlay_timestamp,
+        )
+        commands.append([options.magick, *magick_args])
+        result = run_native_result(options.magick, magick_args, timeout=options.timeout)
+        return result, commands
+
+
+def insert_generated_artifact(
+    conn: sqlite3.Connection,
+    scan_id: str,
+    source_file_id: Optional[int],
+    artifact_type: str,
+    artifact_path: Path,
+    command,
+    result: subprocess.CompletedProcess[str],
+) -> None:
     conn.execute(
         """
         INSERT INTO generated_artifacts
@@ -643,14 +868,103 @@ def generate_video_montage(conn: sqlite3.Connection, scan_id: str, source_file_i
         (
             scan_id,
             source_file_id,
-            "video_montage",
-            str(out_pattern),
-            json.dumps([options.ffmpeg, *args], ensure_ascii=False),
+            artifact_type,
+            str(artifact_path),
+            json.dumps(command, ensure_ascii=False),
             result.returncode,
             result.stdout,
             result.stderr,
             utc_now_iso(),
         ),
+    )
+
+
+def generate_video_thumbnail_sheet(
+    video: Path,
+    out_file: Path,
+    options: Options,
+    duration_seconds: Optional[float] = None,
+) -> tuple[subprocess.CompletedProcess[str], object]:
+    if not command_available(options.ffmpeg):
+        return (
+            subprocess.CompletedProcess([], 1, "", f"ffmpeg not found: {options.ffmpeg}"),
+            [],
+        )
+
+    out_file.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        columns, rows = parse_tile_dimensions(options.video_tile)
+    except ValueError as exc:
+        return subprocess.CompletedProcess([], 2, "", str(exc)), []
+
+    thumbnail_count = columns * rows
+    if duration_seconds is None:
+        duration_seconds = float(thumbnail_count) if options.dry_run else probe_video_duration_seconds(video, options)
+    if duration_seconds is None:
+        return (
+            subprocess.CompletedProcess(
+                [],
+                1,
+                "",
+                "Unable to determine video duration; ffprobe metadata is required for duration-based thumbnails.",
+            ),
+            [],
+        )
+
+    timestamps, step_seconds = video_montage_timestamps(duration_seconds, thumbnail_count)
+    args = build_ffmpeg_video_sheet_args(
+        video,
+        out_file,
+        options.video_scale_width,
+        options.video_tile,
+        timestamps,
+    )
+    if options.dry_run:
+        return subprocess.CompletedProcess([options.ffmpeg, *args], 0, "DRY RUN", ""), [options.ffmpeg, *args]
+
+    result = run_native_result(options.ffmpeg, args, timeout=options.timeout)
+    command: object = [options.ffmpeg, *args]
+    if result.returncode != 0 and command_available(options.magick):
+        fallback_result, fallback_commands = generate_video_sheet_with_magick_fallback(
+            video,
+            out_file,
+            options.video_scale_width,
+            options.video_tile,
+            timestamps,
+            options,
+        )
+        command = {
+            "direct_ffmpeg": [options.ffmpeg, *args],
+            "fallback": fallback_commands,
+            "step_seconds": step_seconds,
+        }
+        result = subprocess.CompletedProcess(
+            fallback_result.args,
+            fallback_result.returncode,
+            "\n".join(part for part in (result.stdout, fallback_result.stdout) if part),
+            "\n".join(part for part in (result.stderr, fallback_result.stderr) if part),
+        )
+
+    return result, command
+
+
+def generate_video_montage(conn: sqlite3.Connection, scan_id: str, source_file_id: int, video: Path, root: Path, options: Options) -> None:
+    if options.no_video_montage or options.scan_only:
+        return
+    if not command_available(options.ffmpeg):
+        return
+    out_dir = artifact_dir_for(video.parent, root, options.output_dir)
+    out_file = out_dir / f"{video.name}.jpg"
+    duration_seconds = video_duration_seconds(conn, source_file_id, video, options)
+    result, command = generate_video_thumbnail_sheet(video, out_file, options, duration_seconds)
+    insert_generated_artifact(
+        conn,
+        scan_id,
+        source_file_id,
+        "video_montage",
+        out_file,
+        command,
+        result,
     )
 
 
@@ -775,7 +1089,9 @@ def parse_ext_list(value: Optional[str]) -> Optional[set[str]]:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Cross-platform archival scanner and montage generator.")
-    parser.add_argument("--root", required=True, type=Path, help="Root folder to scan/process.")
+    parser.add_argument("--root", type=Path, help="Root folder to scan/process. Required unless --video-file is used.")
+    parser.add_argument("--video-file", type=Path, help="Generate one video thumbnail sheet and exit without scanning or writing SQLite metadata.")
+    parser.add_argument("--video-output", "--thumbnail-sheet", dest="video_output", type=Path, help="Output JPG path for --video-file. Default: <video-file>.jpg, or <output-dir>/<video-name>.jpg when --output-dir is set.")
     parser.add_argument("--db", type=Path, help="SQLite database path. Default: <root>/archive_inventory.sqlite")
     parser.add_argument("--output-dir", type=Path, help="Montage output folder. Default: <root>/Montages")
     parser.add_argument("--scan-only", action="store_true", help="Record SQLite metadata only; do not generate montages.")
@@ -788,9 +1104,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-image-montage", action="store_true", help="Do not generate image contact sheets.")
     parser.add_argument("--recursive", action=argparse.BooleanOptionalAction, default=True, help="Walk recursively. Default: true.")
     parser.add_argument("--per-directory-montage", action=argparse.BooleanOptionalAction, default=True, help="Create image montages per source directory. Default: true.")
-    parser.add_argument("--video-fps", default="9999", help="FFmpeg thumbnail filter value for video thumbnails. Default: 999.")
-    parser.add_argument("--video-scale-width", type=int, default=640, help="Video thumbnail width. Default: 640.")
-    parser.add_argument("--video-tile", default="15x15", help="FFmpeg tile layout. Default: 15x15.")
+    parser.add_argument("--video-fps", default="9999", help="Deprecated; video montages now sample by duration and tile count.")
+    parser.add_argument("--video-thumbnail-width", "--video-scale-width", dest="video_scale_width", type=int, default=640, help="Video thumbnail width in horizontal pixels; vertical size is auto (-1). Default: 640.")
+    parser.add_argument("--video-tile", default="15x15", help="Video tile layout. The columns*rows count is the number of sampled thumbnails. Default: 15x15.")
     parser.add_argument("--image-tile", default="15x15", help="ImageMagick montage tile layout. Default: 15x15.")
     parser.add_argument("--image-geometry", default="300x300>", help="Image resize geometry before montage. Default: 300x300>.")
     parser.add_argument("--image-page-size", type=int, default=225, help="Images per montage page. Default: 225.")
@@ -805,19 +1121,8 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: Optional[Sequence[str]] = None) -> int:
-    args = build_parser().parse_args(argv)
-    root = args.root.expanduser().resolve()
-    if not root.is_dir():
-        print(f"Root is not a directory: {root}", file=sys.stderr)
-        return 2
-
-    db = (args.db or (root / "archive_inventory.sqlite")).expanduser().resolve()
-    output_dir = (args.output_dir or (root / "Montages")).expanduser().resolve()
-    db.parent.mkdir(parents=True, exist_ok=True)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    options = Options(
+def options_from_args(args: argparse.Namespace, root: Path, db: Path, output_dir: Path) -> Options:
+    return Options(
         root=root,
         db=db,
         output_dir=output_dir,
@@ -846,6 +1151,62 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         exclude_names={x.strip().lower() for x in args.exclude_names.split(",") if x.strip()},
         dry_run=args.dry_run,
     )
+
+
+def output_path_for_single_video(args: argparse.Namespace, video: Path) -> Path:
+    if args.video_output is not None:
+        return args.video_output.expanduser().resolve()
+    if args.output_dir is not None:
+        return (args.output_dir.expanduser().resolve() / f"{video.name}.jpg").resolve()
+    return video.with_name(f"{video.name}.jpg").resolve()
+
+
+def generate_single_video_sheet(args: argparse.Namespace) -> int:
+    video = args.video_file.expanduser().resolve()
+    if not video.is_file():
+        print(f"Video file is not a file: {video}", file=sys.stderr)
+        return 2
+
+    root = args.root.expanduser().resolve() if args.root else video.parent
+    db = (args.db or (root / "archive_inventory.sqlite")).expanduser().resolve()
+    output_dir = args.output_dir.expanduser().resolve() if args.output_dir else video.parent
+    out_file = output_path_for_single_video(args, video)
+    options = options_from_args(args, root, db, output_dir)
+
+    result, command = generate_video_thumbnail_sheet(video, out_file, options)
+    if args.dry_run:
+        print(json.dumps(command, ensure_ascii=False, indent=2))
+    if result.stdout.strip():
+        print(result.stdout.strip())
+    if result.returncode != 0:
+        if result.stderr.strip():
+            print(result.stderr.strip(), file=sys.stderr)
+        return result.returncode or 1
+
+    print(f"Thumbnail sheet: {out_file}")
+    return 0
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    args = build_parser().parse_args(argv)
+    if args.video_file is not None:
+        return generate_single_video_sheet(args)
+
+    if args.root is None:
+        print("Root is required unless --video-file is used.", file=sys.stderr)
+        return 2
+
+    root = args.root.expanduser().resolve()
+    if not root.is_dir():
+        print(f"Root is not a directory: {root}", file=sys.stderr)
+        return 2
+
+    db = (args.db or (root / "archive_inventory.sqlite")).expanduser().resolve()
+    output_dir = (args.output_dir or (root / "Montages")).expanduser().resolve()
+    db.parent.mkdir(parents=True, exist_ok=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    options = options_from_args(args, root, db, output_dir)
 
     scan_id = str(uuid.uuid4())
     started = utc_now_iso()

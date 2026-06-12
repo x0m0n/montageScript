@@ -106,6 +106,15 @@ class ArchiveMontageUnitTests(unittest.TestCase):
         self.assertEqual(summary["frame_rate"], "30000/1001")
         self.assertEqual(summary["stream_count"], 2)
 
+    def test_video_montage_timestamps_use_tile_count_and_microsecond_step(self):
+        columns, rows = am.parse_tile_dimensions("3x2")
+        timestamps, step = am.video_montage_timestamps(10.0, columns * rows)
+
+        self.assertEqual(columns * rows, 6)
+        self.assertEqual(step, 1.666667)
+        self.assertEqual(timestamps, [0.0, 1.666667, 3.333334, 5.000001, 6.666668, 8.333335])
+        self.assertEqual(am.format_ffmpeg_timestamp(timestamps[1]), "00:00:01.666667")
+
     def test_should_include_excludes_database_output_and_blocklists(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -205,15 +214,53 @@ class ArchiveMontageUnitTests(unittest.TestCase):
                 ).fetchone()
 
             self.assertEqual(row[0], "video_montage")
-            self.assertIn("動画.mp4.%03d.jpg", row[1])
+            self.assertIn("動画.mp4.jpg", row[1])
             self.assertEqual(row[3], 0)
             self.assertEqual(row[4], "DRY RUN")
             command = json.loads(row[2])
-            self.assertIn("-vf", command)
-            self.assertIn("thumbnail=1,scale=200:-1,tile=5x5", command)
+            self.assertEqual(command.count("-ss"), 25)
+            self.assertIn("-filter_complex", command)
+            filter_complex = command[command.index("-filter_complex") + 1]
+            self.assertIn("scale=200:-1", filter_complex)
+            self.assertIn("concat=n=25", filter_complex)
+            self.assertIn("tile=5x5", filter_complex)
             self.assertIn("-y", command)
             self.assertNotIn("-n", command)
-            self.assertNotIn("-frames:v", command)
+            self.assertIn("-frames:v", command)
+
+    def test_main_direct_video_file_generates_sheet_without_scan_db(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            video = root / "single.mp4"
+            out_file = root / "sheet.jpg"
+            video.write_bytes(b"not a real video")
+            observed: dict[str, object] = {}
+
+            def fake_generate(video_arg, out_arg, options, duration_seconds=None):
+                observed["video"] = video_arg
+                observed["out"] = out_arg
+                observed["root"] = options.root
+                observed["tile"] = options.video_tile
+                observed["width"] = options.video_scale_width
+                observed["duration"] = duration_seconds
+                return subprocess.CompletedProcess(["ffmpeg"], 0, "", ""), ["ffmpeg"]
+
+            with patch.object(am, "init_db", side_effect=AssertionError("direct mode should not initialize SQLite")):
+                with patch.object(am, "generate_video_thumbnail_sheet", side_effect=fake_generate):
+                    exit_code = am.main([
+                        "--video-file", str(video),
+                        "--video-output", str(out_file),
+                        "--video-tile", "2x2",
+                        "--video-thumbnail-width", "123",
+                    ])
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(observed["video"], video.resolve())
+            self.assertEqual(observed["out"], out_file.resolve())
+            self.assertEqual(observed["root"], root.resolve())
+            self.assertEqual(observed["tile"], "2x2")
+            self.assertEqual(observed["width"], 123)
+            self.assertIsNone(observed["duration"])
 
     def test_main_generates_video_montages_during_single_scan_pass(self):
         with tempfile.TemporaryDirectory() as td:

@@ -93,10 +93,12 @@ python archive_montage.py \
 
 ## Video montage settings
 
-Default video filter:
+Default video sampling:
 
 ```text
-fps=0.1,scale=400:-1,tile=15x15
+15x15 tile = 225 thumbnails
+thumbnail width 640 pixels, height auto (-1)
+sample step = video duration / 225, rounded to microseconds
 ```
 
 Example custom settings:
@@ -104,9 +106,18 @@ Example custom settings:
 ```bash
 python archive_montage.py \
   --root "/path/to/archive" \
-  --video-fps 0.1 \
-  --video-scale-width 400 \
-  --video-tile 15x15
+  --video-thumbnail-width 400 \
+  --video-tile 10x10
+```
+
+Generate one video thumbnail sheet without scanning or writing SQLite metadata:
+
+```bash
+python archive_montage.py \
+  --video-file "/path/to/video.mp4" \
+  --video-output "/path/to/video-sheet.jpg" \
+  --video-thumbnail-width 400 \
+  --video-tile 10x10
 ```
 
 ## Image montage settings

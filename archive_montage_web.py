@@ -119,8 +119,7 @@ def build_archive_command(form: dict[str, list[str]]) -> tuple[list[str], Option
 
     add_optional_value(args, form, "--db", "db")
     add_optional_value(args, form, "--output-dir", "output_dir")
-    add_optional_value(args, form, "--video-fps", "video_fps")
-    add_optional_value(args, form, "--video-scale-width", "video_scale_width")
+    add_optional_value(args, form, "--video-thumbnail-width", "video_scale_width")
     add_optional_value(args, form, "--video-tile", "video_tile")
     add_optional_value(args, form, "--image-tile", "image_tile")
     add_optional_value(args, form, "--image-geometry", "image_geometry")
@@ -329,9 +328,8 @@ HTML_PAGE = r"""<!doctype html>
     <fieldset class="full">
       <legend>Video montage</legend>
       <div class="checks">
-        <label>FPS <input name="video_fps" type="text" value="1"></label>
-        <label>Scale width <input name="video_scale_width" type="number" value="200"></label>
-        <label>Tile <input name="video_tile" type="text" value="5x5"></label>
+        <label>Thumbnail width <input name="video_scale_width" type="number" value="640"></label>
+        <label>Tile <input name="video_tile" type="text" value="15x15"></label>
       </div>
     </fieldset>
 
