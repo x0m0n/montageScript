@@ -58,6 +58,19 @@ DEFAULT_EXCLUDE_EXTENSIONS = {
     ".db", ".sqlite", ".sqlite3", ".ini", ".xml", ".7z", ".zip",".py",".ps1",".git",".md"
 }
 
+ARCHIVE_FORMAT_SUFFIXES = {
+    "tar": ".tar",
+    "tar.gz": ".tar.gz",
+    "tar.xz": ".tar.xz",
+    "tar.bz2": ".tar.bz2",
+}
+
+ARCHIVE_COMPRESSOR_SWITCHES = {
+    "tar.gz": "-tgzip",
+    "tar.xz": "-txz",
+    "tar.bz2": "-tbzip2",
+}
+
 ProgressCallback = Callable[[str], None]
 WINDOWS_LONG_PATH_THRESHOLD = 240
 WINDOWS_LONG_PATH_PREFIX = "\\\\?\\"
@@ -478,6 +491,9 @@ class Options:
     ffmpeg: str
     ffprobe: str
     magick: str
+    seven_zip: str
+    archive_format: Optional[str]
+    delete_source_after_archive: bool
     timeout: int
     include_exts: Optional[set[str]]
     exclude_exts: set[str]
@@ -996,6 +1012,153 @@ def insert_generated_artifact(
     )
 
 
+def normalize_archive_format(value: str) -> str:
+    normalized = value.strip().lower().lstrip(".")
+    if normalized not in ARCHIVE_FORMAT_SUFFIXES:
+        choices = ", ".join(ARCHIVE_FORMAT_SUFFIXES)
+        raise ValueError(f"Archive format must be one of: {choices}")
+    return normalized
+
+
+def archive_format_arg(value: str) -> str:
+    try:
+        return normalize_archive_format(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
+def archive_suffix_for_format(archive_format: str) -> str:
+    return ARCHIVE_FORMAT_SUFFIXES[normalize_archive_format(archive_format)]
+
+
+def archive_dir_for(source_dir: Path, root: Path, output_dir: Path) -> Path:
+    rel = safe_relative(source_dir, root)
+    safe_rel = Path(rel) if rel not in (".", "") else Path("root")
+    return output_dir / safe_rel / "archives"
+
+
+def archive_path_for_video(video: Path, root: Path, output_dir: Path, archive_format: str) -> Path:
+    return archive_dir_for(video.parent, root, output_dir) / f"{video.name}{archive_suffix_for_format(archive_format)}"
+
+
+def build_7z_tar_args(input_file: Path, output_file: Path) -> list[str]:
+    return ["a", "-y", "-ttar", native_path(output_file), input_file.name]
+
+
+def build_7z_compression_args(tar_file: Path, output_file: Path, archive_format: str) -> list[str]:
+    archive_format = normalize_archive_format(archive_format)
+    compressor = ARCHIVE_COMPRESSOR_SWITCHES.get(archive_format)
+    if compressor is None:
+        raise ValueError(f"Archive format does not need a compression step: {archive_format}")
+    return ["a", "-y", compressor, native_path(output_file), tar_file.name]
+
+
+def archive_step_record(seven_zip: str, args: Sequence[str], cwd: Path) -> dict[str, object]:
+    return {
+        "cwd": path_text(cwd),
+        "command": [seven_zip, *args],
+    }
+
+
+def archive_command_record(steps: Sequence[dict[str, object]], delete_source: bool) -> dict[str, object]:
+    record: dict[str, object] = {"steps": list(steps)}
+    if delete_source:
+        record["delete_source_after_archive"] = True
+    return record
+
+
+def combine_archive_results(command: object, results: Sequence[subprocess.CompletedProcess[str]]) -> subprocess.CompletedProcess[str]:
+    if not results:
+        return subprocess.CompletedProcess(command, 0, "", "")
+    stdout = "\n".join(result.stdout.strip() for result in results if result.stdout.strip())
+    stderr = "\n".join(result.stderr.strip() for result in results if result.stderr.strip())
+    return subprocess.CompletedProcess(command, results[-1].returncode, stdout, stderr)
+
+
+def archive_video_file_with_7z(
+    video: Path,
+    archive_file: Path,
+    archive_format: str,
+    seven_zip: str = "7z",
+    timeout: Optional[int] = None,
+    dry_run: bool = False,
+    delete_source: bool = False,
+    progress: Optional[ProgressCallback] = None,
+) -> tuple[subprocess.CompletedProcess[str], object]:
+    try:
+        archive_format = normalize_archive_format(archive_format)
+    except ValueError as exc:
+        return subprocess.CompletedProcess([], 2, "", str(exc)), {}
+
+    if comparable_path_text(video) == comparable_path_text(archive_file):
+        return subprocess.CompletedProcess([], 2, "", "Archive output path must differ from the source video."), {}
+
+    steps: list[dict[str, object]] = []
+
+    def add_step(args: list[str], cwd: Path) -> None:
+        steps.append(archive_step_record(seven_zip, args, cwd))
+
+    def run_step(args: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
+        add_step(args, cwd)
+        return run_native(seven_zip, args, cwd=cwd, timeout=timeout)
+
+    if archive_format == "tar":
+        tar_args = build_7z_tar_args(video, archive_file)
+        add_step(tar_args, video.parent)
+    else:
+        dry_run_tar = archive_file.with_name(f".{archive_file.name}.tmp.tar")
+        add_step(build_7z_tar_args(video, dry_run_tar), video.parent)
+        add_step(build_7z_compression_args(dry_run_tar, archive_file, archive_format), dry_run_tar.parent)
+
+    if dry_run:
+        command = archive_command_record(steps, delete_source)
+        return subprocess.CompletedProcess(command, 0, "DRY RUN", ""), command
+
+    if not command_available(seven_zip):
+        command = archive_command_record(steps, delete_source)
+        return subprocess.CompletedProcess(command, 1, "", f"7z not found: {seven_zip}"), command
+
+    ensure_dir(archive_file.parent)
+    results: list[subprocess.CompletedProcess[str]] = []
+
+    if archive_format == "tar":
+        if progress is not None:
+            progress(f"Creating {archive_format} archive with 7z")
+        steps.clear()
+        results.append(run_step(build_7z_tar_args(video, archive_file), video.parent))
+    else:
+        with tempfile.TemporaryDirectory(prefix="archive-montage-7z-") as tmp:
+            tmp_dir = Path(tmp)
+            temp_tar = tmp_dir / f"{video.name}.tar"
+            steps.clear()
+            if progress is not None:
+                progress("Creating temporary tar with 7z")
+            tar_result = run_step(build_7z_tar_args(video, temp_tar), video.parent)
+            results.append(tar_result)
+            if tar_result.returncode == 0:
+                if progress is not None:
+                    progress(f"Compressing tar as {archive_format} with 7z")
+                results.append(run_step(build_7z_compression_args(temp_tar, archive_file, archive_format), tmp_dir))
+
+    command = archive_command_record(steps, delete_source)
+    result = combine_archive_results(command, results)
+
+    if result.returncode == 0 and delete_source:
+        try:
+            if path_exists(video):
+                os.remove(native_path(video))
+        except OSError as exc:
+            stderr = "\n".join(part for part in (result.stderr, f"Archived but failed to delete source: {exc}") if part)
+            result = subprocess.CompletedProcess(result.args, 1, result.stdout, stderr)
+
+    if progress is not None:
+        if result.returncode == 0:
+            progress("Archive complete")
+        else:
+            progress("Archive failed")
+    return result, command
+
+
 def generate_video_thumbnail_sheet(
     video: Path,
     out_file: Path,
@@ -1109,6 +1272,33 @@ def generate_video_montage(conn: sqlite3.Connection, scan_id: str, source_file_i
         command,
         result,
     )
+
+
+def generate_video_archive(conn: sqlite3.Connection, scan_id: str, source_file_id: int, video: Path, root: Path, options: Options) -> None:
+    if options.archive_format is None or options.scan_only:
+        return
+    out_file = archive_path_for_video(video, root, options.output_dir, options.archive_format)
+    result, command = archive_video_file_with_7z(
+        video,
+        out_file,
+        options.archive_format,
+        seven_zip=options.seven_zip,
+        timeout=options.timeout,
+        dry_run=options.dry_run,
+        delete_source=options.delete_source_after_archive,
+        progress=lambda message: print(f"  {message}", flush=True),
+    )
+    insert_generated_artifact(
+        conn,
+        scan_id,
+        source_file_id,
+        "video_archive",
+        out_file,
+        command,
+        result,
+    )
+    if result.returncode != 0 and result.stderr.strip():
+        print(result.stderr.strip(), file=sys.stderr, flush=True)
 
 
 def chunks(items: Sequence[Path], size: int) -> Iterable[Sequence[Path]]:
@@ -1236,7 +1426,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--video-file", type=Path, help="Generate one video thumbnail sheet and exit without scanning or writing SQLite metadata.")
     parser.add_argument("--video-output", "--thumbnail-sheet", dest="video_output", type=Path, help="Output JPG path for --video-file. Default: <video-file>.jpg, or <output-dir>/<video-name>.jpg when --output-dir is set.")
     parser.add_argument("--db", type=Path, help="SQLite database path. Default: <root>/archive_inventory.sqlite")
-    parser.add_argument("--output-dir", type=Path, help="Montage output folder. Default: <root>/Montages")
+    parser.add_argument("--output-dir", type=Path, help="Generated output folder. Default: <root>/Montages")
     parser.add_argument("--scan-only", action="store_true", help="Record SQLite metadata only; do not generate montages.")
     parser.add_argument("--montage-only", action="store_true", help="Generate montages only; still records minimal scan rows for artifact linkage.")
     parser.add_argument("--no-hash", action="store_true", help="Skip SHA256 hashing.")
@@ -1250,17 +1440,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--video-fps", default="9999", help="Deprecated; video montages now sample by duration and tile count.")
     parser.add_argument("--video-thumbnail-width", "--video-scale-width", dest="video_scale_width", type=int, default=640, help="Video thumbnail width in horizontal pixels; vertical size is auto (-1). Default: 640.")
     parser.add_argument("--video-tile", default="15x15", help="Video tile layout. The columns*rows count is the number of sampled thumbnails. Default: 15x15.")
+    parser.add_argument("--archive-format", "--archive-type", dest="archive_format", type=archive_format_arg, default=None, metavar="FORMAT", help="Archive videos with 7z using tar, tar.gz, tar.xz, or tar.bz2. When used with --root, each scanned video gets its own archive. When used with --video-file, that video is archived.")
+    parser.add_argument("--archive-output", type=Path, help="Output archive path for --video-file with --archive-format. Default: <video-file>.<format>, or <output-dir>/<video-name>.<format> when --output-dir is set.")
+    parser.add_argument("--delete-source-after-archive", "--archive-delete-source", "--delete-source", dest="delete_source_after_archive", action="store_true", help="Delete a source video only after its 7z archive succeeds.")
     parser.add_argument("--image-tile", default="15x15", help="ImageMagick montage tile layout. Default: 15x15.")
     parser.add_argument("--image-geometry", default="300x300>", help="Image resize geometry before montage. Default: 300x300>.")
     parser.add_argument("--image-page-size", type=int, default=225, help="Images per montage page. Default: 225.")
     parser.add_argument("--ffmpeg", default="ffmpeg", help="ffmpeg executable name/path.")
     parser.add_argument("--ffprobe", default="ffprobe", help="ffprobe executable name/path.")
     parser.add_argument("--magick", default="magick", help="ImageMagick executable name/path.")
+    parser.add_argument("--seven-zip", "--7z", dest="seven_zip", default="7z", help="7z executable name/path. Default: 7z.")
     parser.add_argument("--timeout", type=int, default=3600, help="Per-command timeout in seconds. Default: 3600.")
     parser.add_argument("--include-exts", default=None, help="Comma-separated extension allowlist, e.g. .mp4,.jpg. Default: scan all non-excluded files.")
     parser.add_argument("--exclude-exts", default=",".join(sorted(DEFAULT_EXCLUDE_EXTENSIONS)), help="Comma-separated extension blocklist.")
     parser.add_argument("--exclude-names", default=",".join(sorted(DEFAULT_EXCLUDE_NAMES)), help="Comma-separated filename blocklist.")
-    parser.add_argument("--dry-run", action="store_true", help="Do not run ffmpeg/magick montage commands; record intended commands.")
+    parser.add_argument("--dry-run", action="store_true", help="Do not run ffmpeg/magick/7z commands; record intended commands.")
     return parser
 
 
@@ -1288,6 +1482,9 @@ def options_from_args(args: argparse.Namespace, root: Path, db: Path, output_dir
         ffmpeg=args.ffmpeg,
         ffprobe=args.ffprobe,
         magick=args.magick,
+        seven_zip=args.seven_zip,
+        archive_format=args.archive_format,
+        delete_source_after_archive=args.delete_source_after_archive,
         timeout=args.timeout,
         include_exts=parse_ext_list(args.include_exts),
         exclude_exts=parse_ext_list(args.exclude_exts) or set(),
@@ -1304,7 +1501,18 @@ def output_path_for_single_video(args: argparse.Namespace, video: Path) -> Path:
     return safe_resolve_path(video.with_name(f"{video.name}.jpg"))
 
 
-def generate_single_video_sheet(args: argparse.Namespace) -> int:
+def output_path_for_single_video_archive(args: argparse.Namespace, video: Path) -> Path:
+    if args.archive_format is None:
+        raise ValueError("Archive output requires --archive-format.")
+    if args.archive_output is not None:
+        return safe_resolve_path(args.archive_output)
+    suffix = archive_suffix_for_format(args.archive_format)
+    if args.output_dir is not None:
+        return safe_resolve_path(safe_resolve_path(args.output_dir) / f"{video.name}{suffix}")
+    return safe_resolve_path(video.with_name(f"{video.name}{suffix}"))
+
+
+def process_single_video_file(args: argparse.Namespace) -> int:
     video = safe_resolve_path(args.video_file)
     if not path_is_file(video):
         print(f"Video file is not a file: {video}", file=sys.stderr)
@@ -1313,32 +1521,72 @@ def generate_single_video_sheet(args: argparse.Namespace) -> int:
     root = safe_resolve_path(args.root) if args.root else video.parent
     db = safe_resolve_path(args.db or (root / "archive_inventory.sqlite"))
     output_dir = safe_resolve_path(args.output_dir) if args.output_dir else video.parent
-    out_file = output_path_for_single_video(args, video)
     options = options_from_args(args, root, db, output_dir)
+    dry_run_commands: dict[str, object] = {}
 
-    result, command = generate_video_thumbnail_sheet(
-        video,
-        out_file,
-        options,
-        progress=lambda message: print(f"[video] {message}", flush=True),
-    )
-    if args.dry_run:
-        print(json.dumps(command, ensure_ascii=False, indent=2))
-    if result.stdout.strip():
-        print(result.stdout.strip())
-    if result.returncode != 0:
-        if result.stderr.strip():
-            print(result.stderr.strip(), file=sys.stderr)
-        return result.returncode or 1
+    if args.no_video_montage and args.archive_format is None:
+        print("Nothing to do: --no-video-montage requires --archive-format in --video-file mode.", file=sys.stderr)
+        return 2
 
-    print(f"Thumbnail sheet: {out_file}")
+    if not args.no_video_montage:
+        out_file = output_path_for_single_video(args, video)
+        result, command = generate_video_thumbnail_sheet(
+            video,
+            out_file,
+            options,
+            progress=lambda message: print(f"[video] {message}", flush=True),
+        )
+        if args.dry_run:
+            dry_run_commands["video_sheet"] = command
+        elif result.stdout.strip():
+            print(result.stdout.strip())
+        if result.returncode != 0:
+            if result.stderr.strip():
+                print(result.stderr.strip(), file=sys.stderr)
+            return result.returncode or 1
+
+        print(f"Thumbnail sheet: {out_file}")
+
+    if args.archive_format is not None:
+        archive_file = output_path_for_single_video_archive(args, video)
+        result, command = archive_video_file_with_7z(
+            video,
+            archive_file,
+            args.archive_format,
+            seven_zip=args.seven_zip,
+            timeout=args.timeout,
+            dry_run=args.dry_run,
+            delete_source=args.delete_source_after_archive,
+            progress=lambda message: print(f"[archive] {message}", flush=True),
+        )
+        if args.dry_run:
+            dry_run_commands["video_archive"] = command
+        elif result.stdout.strip():
+            print(result.stdout.strip())
+        if result.returncode != 0:
+            if result.stderr.strip():
+                print(result.stderr.strip(), file=sys.stderr)
+            return result.returncode or 1
+
+        print(f"Archive: {archive_file}")
+        if args.delete_source_after_archive and not args.dry_run:
+            print(f"Deleted source: {video}")
+
+    if args.dry_run and dry_run_commands:
+        print(json.dumps(dry_run_commands, ensure_ascii=False, indent=2))
     return 0
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.delete_source_after_archive and args.archive_format is None:
+        print("--delete-source-after-archive requires --archive-format.", file=sys.stderr)
+        return 2
+    if args.archive_output is not None and args.video_file is None:
+        print("--archive-output can only be used with --video-file.", file=sys.stderr)
+        return 2
     if args.video_file is not None:
-        return generate_single_video_sheet(args)
+        return process_single_video_file(args)
 
     if args.root is None:
         print("Root is required unless --video-file is used.", file=sys.stderr)
@@ -1405,6 +1653,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         conn.commit()
                         print(f"Video montage: {path}", flush=True)
                         generate_video_montage(conn, scan_id, file_id, path, root, options)
+                        conn.commit()
+                    if options.archive_format is not None and not options.scan_only:
+                        conn.commit()
+                        print(f"Video archive: {path}", flush=True)
+                        generate_video_archive(conn, scan_id, file_id, path, root, options)
                         conn.commit()
                 elif ext in IMAGE_EXTENSIONS and not path.name.lower().startswith("montage-"):
                     page = image_montages.add(path, root, options)

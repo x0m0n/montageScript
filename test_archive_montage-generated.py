@@ -59,6 +59,9 @@ class ArchiveMontageUnitTests(unittest.TestCase):
             ffmpeg="ffmpeg",
             ffprobe="ffprobe",
             magick="magick",
+            seven_zip="7z",
+            archive_format=None,
+            delete_source_after_archive=False,
             timeout=5,
             include_exts=None,
             exclude_exts=set(am.DEFAULT_EXCLUDE_EXTENSIONS),
@@ -142,6 +145,23 @@ class ArchiveMontageUnitTests(unittest.TestCase):
         self.assertEqual(step, 1.666667)
         self.assertEqual(timestamps, [0.0, 1.666667, 3.333334, 5.000001, 6.666668, 8.333335])
         self.assertEqual(am.format_ffmpeg_timestamp(timestamps[1]), "00:00:01.666667")
+
+    def test_7z_archive_args_use_filename_inputs_and_expected_formats(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            video = root / "clip.mp4"
+            tar_file = root / "clip.mp4.tar"
+            xz_file = root / "clip.mp4.tar.xz"
+
+            self.assertEqual(am.archive_suffix_for_format("tar.gz"), ".tar.gz")
+            self.assertEqual(
+                am.build_7z_tar_args(video, tar_file),
+                ["a", "-y", "-ttar", am.native_path(tar_file), "clip.mp4"],
+            )
+            self.assertEqual(
+                am.build_7z_compression_args(tar_file, xz_file, "tar.xz"),
+                ["a", "-y", "-txz", am.native_path(xz_file), "clip.mp4.tar"],
+            )
 
     def test_should_include_excludes_database_output_and_blocklists(self):
         with tempfile.TemporaryDirectory() as td:
@@ -292,6 +312,39 @@ class ArchiveMontageUnitTests(unittest.TestCase):
             self.assertIsNone(observed["duration"])
             self.assertTrue(observed["progress"])
 
+    def test_main_direct_video_file_can_archive_with_7z_and_delete_source(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            video = root / "single.mp4"
+            video.write_bytes(b"not a real video")
+            calls: list[tuple[str, list[str], Path | None, int | None]] = []
+
+            def fake_run_native(exe, args, cwd=None, timeout=None):
+                calls.append((exe, list(args), cwd, timeout))
+                return subprocess.CompletedProcess([exe, *args], 0, "", "")
+
+            with patch.object(am, "generate_video_thumbnail_sheet", side_effect=AssertionError("sheet should be skipped")):
+                with patch.object(am, "command_available", return_value=True):
+                    with patch.object(am, "run_native", side_effect=fake_run_native):
+                        exit_code = am.main([
+                            "--video-file", str(video),
+                            "--no-video-montage",
+                            "--archive-format", "tar.gz",
+                            "--delete-source-after-archive",
+                            "--timeout", "12",
+                        ])
+
+            self.assertEqual(exit_code, 0)
+            self.assertFalse(video.exists())
+            self.assertEqual(len(calls), 2)
+            self.assertEqual(calls[0][0], "7z")
+            self.assertEqual(calls[0][1][2], "-ttar")
+            self.assertEqual(calls[0][1][-1], "single.mp4")
+            self.assertEqual(calls[0][2], root.resolve())
+            self.assertEqual(calls[0][3], 12)
+            self.assertEqual(calls[1][1][2], "-tgzip")
+            self.assertEqual(calls[1][1][3], am.native_path(root / "single.mp4.tar.gz"))
+
     def test_main_generates_video_montages_during_single_scan_pass(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -326,6 +379,43 @@ class ArchiveMontageUnitTests(unittest.TestCase):
                 ("first.mp4", ["first.mp4"]),
                 ("second.mp4", ["first.mp4", "second.mp4"]),
             ])
+
+    def test_main_archives_videos_during_scan_when_archive_format_is_set(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            video = root / "scan.mp4"
+            video.write_bytes(b"video")
+            db = root / "inventory.sqlite"
+            out = root / "Montages"
+
+            with patch.object(am, "iter_paths", return_value=iter([video])):
+                exit_code = am.main([
+                    "--root", str(root),
+                    "--db", str(db),
+                    "--output-dir", str(out),
+                    "--include-exts", ".mp4",
+                    "--no-video-montage",
+                    "--no-image-montage",
+                    "--no-ffprobe",
+                    "--no-magick-identify",
+                    "--no-hash",
+                    "--archive-format", "tar",
+                    "--dry-run",
+                ])
+
+            self.assertEqual(exit_code, 0)
+            with closing(sqlite3.connect(db)) as conn:
+                row = conn.execute(
+                    "SELECT artifact_type, artifact_path, command, exit_code, stdout FROM generated_artifacts"
+                ).fetchone()
+
+            self.assertEqual(row[0], "video_archive")
+            self.assertIn(os.path.join("Montages", "root", "archives", "scan.mp4.tar"), row[1])
+            self.assertEqual(row[3], 0)
+            self.assertEqual(row[4], "DRY RUN")
+            command = json.loads(row[2])
+            self.assertEqual(len(command["steps"]), 1)
+            self.assertIn("-ttar", command["steps"][0]["command"])
 
     def test_main_generates_image_pages_during_single_scan_pass(self):
         with tempfile.TemporaryDirectory() as td:

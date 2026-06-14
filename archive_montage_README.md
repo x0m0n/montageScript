@@ -7,6 +7,7 @@ It uses Python for Unicode-safe directory walking, file metadata collection, has
 - `ffmpeg` for video thumbnail contact sheets
 - `ffprobe` for video/audio technical metadata
 - `magick` from ImageMagick for image contact sheets and image metadata
+- `7z` from 7-Zip for optional per-video tar archives
 
 ## Install prerequisites
 
@@ -18,13 +19,14 @@ Windows:
 winget install Python.Python.3.12
 winget install Gyan.FFmpeg
 winget install ImageMagick.ImageMagick
+winget install 7zip.7zip
 ```
 
 Linux example:
 
 ```bash
 sudo apt update
-sudo apt install python3 ffmpeg imagemagick
+sudo apt install python3 ffmpeg imagemagick p7zip-full
 ```
 
 No Python packages are required beyond the standard library.
@@ -119,6 +121,63 @@ python archive_montage.py \
   --video-thumbnail-width 400 \
   --video-tile 10x10
 ```
+
+## Video archives with 7z
+
+When `--archive-format` is set, videos are archived individually with `7z`.
+
+Supported formats:
+
+```text
+tar
+tar.gz
+tar.xz
+tar.bz2
+```
+
+During a scan, each video archive is written under the generated output folder:
+
+```text
+<output-dir>/<relative-source-dir>/archives/<video-name>.<format>
+```
+
+Example scan that creates video montages and per-video `tar.gz` archives:
+
+```bash
+python archive_montage.py \
+  --root "/path/to/archive" \
+  --archive-format tar.gz
+```
+
+Archive videos without generating video thumbnail sheets:
+
+```bash
+python archive_montage.py \
+  --root "/path/to/archive" \
+  --no-video-montage \
+  --archive-format tar.xz
+```
+
+Generate one video thumbnail sheet and archive that same video:
+
+```bash
+python archive_montage.py \
+  --video-file "/path/to/video.mp4" \
+  --archive-format tar.bz2
+```
+
+Archive one video only, then delete the source after the archive succeeds:
+
+```bash
+python archive_montage.py \
+  --video-file "/path/to/video.mp4" \
+  --no-video-montage \
+  --archive-format tar.gz \
+  --delete-source-after-archive
+```
+
+Use `--archive-output` with `--video-file` to choose a specific archive path.
+Use `--seven-zip` if the 7-Zip executable is named something other than `7z`.
 
 ## Image montage settings
 
